@@ -1,0 +1,6 @@
+bserve
+bcurl
+*.dSYM/
+*.o
+.DS_Store
+__pycache__/

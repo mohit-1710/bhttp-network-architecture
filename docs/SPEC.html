@@ -1,0 +1,266 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml">
+<head>
+  <meta charset="utf-8" />
+  <meta name="generator" content="pandoc 3.10.2" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes" />
+  <title>BHTTP/1 — HTTP, in binary</title>
+  <style>
+
+span.smallcaps{font-variant: small-caps;}
+div.columns{display: flex; gap: 1.5em;}
+div.column{flex: auto;}
+@media screen {
+div.columns{gap: min(4vw, 1.5em);}
+div.column{overflow-x: auto;}
+}
+div.hanging-indent{margin-left: 1.5em; text-indent: -1.5em;}
+
+ul.task-list[class]{list-style: none;}
+ul.task-list li input[type="checkbox"] {
+font-size: inherit;
+width: 0.8em;
+margin: 0 0.8em 0.2em -1.6em;
+vertical-align: middle;
+}
+.display.math{display: block; text-align: center; margin: 0.5rem auto;}
+</style>
+  <style type="text/css">@page { size: A4; margin: 13mm 14mm; }
+body { font: 9.4pt/1.36 -apple-system, "Helvetica Neue", Arial, sans-serif; color: #111; max-width: none; margin: 0; }
+header#title-block-header { margin-bottom: 4px; border-bottom: 2px solid #111; padding-bottom: 4px; }
+h1.title { font-size: 17pt; margin: 0; } p.subtitle { margin: 0; color: #555; font-size: 9.5pt; }
+h2 { font-size: 10.5pt; margin: 9px 0 3px; border-bottom: 1px solid #ccc; }
+p, ul { margin: 3px 0; } li { margin: 1px 0; } ul { padding-left: 16px; }
+pre { font: 8.2pt/1.25 Menlo, monospace; background: #f5f5f5; padding: 5px 7px; margin: 4px 0; border-radius: 3px; }
+code { font: 8.4pt Menlo, monospace; }
+table { border-collapse: collapse; margin: 4px 0; font-size: 8.8pt; }
+td, th { border: 1px solid #ccc; padding: 1px 6px; text-align: left; vertical-align: top; }
+th { background: #eee; }
+</style>
+</head>
+<body>
+<header id="title-block-header">
+<h1 class="title">BHTTP/1 — HTTP, in binary</h1>
+<p class="subtitle">Protocol specification · version 1</p>
+</header>
+<p>The key words MUST, MUST NOT, SHOULD and MAY are used as in RFC 2119.
+All integers are unsigned and big-endian (network byte order).</p>
+<h2 id="model">1. Model</h2>
+<p>BHTTP/1 carries HTTP request/response semantics over one TCP
+connection (default port <strong>9000</strong>) as a sequence of binary
+<strong>frames</strong>. There is no connection preface. The client
+sends a request, reads the complete response, and MAY then send another
+request <strong>on the same connection</strong>. A client MUST NOT open
+a second connection to make further requests to the same server. The
+server keeps the connection open until the client closes it (or after 30
+s idle, which is implementation-defined).</p>
+<h2 id="frame-header-8-bytes-fixed">2. Frame header (8 bytes,
+fixed)</h2>
+<pre><code> 0                   1                   2                   3
+ 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
++-----------------------------------------------+---------------+
+|                 Length (24)                   |   Type (8)    |
++---------------+-----------------------------------------------+
+|   Flags (8)   |               Stream ID (24)                  |
++---------------+-----------------------------------------------+
+|                    Payload (Length bytes) ...                 |</code></pre>
+<ul>
+<li><strong>Length</strong>: payload size in bytes, excluding these 8
+header bytes (0 … 16 777 215).</li>
+<li><strong>Type</strong>: <code>0x00</code> DATA, <code>0x01</code>
+HEADERS. Every other value is <strong>unknown</strong> (see §3).</li>
+<li><strong>Flags</strong>: <code>0x01</code> END_STREAM, set on the
+last frame of a request or response. Senders MUST set every other bit to
+0; receivers MUST ignore bits they do not know.</li>
+<li><strong>Stream ID</strong>: ties a response to its request. Requests
+use 1, 2, 3, … (strictly increasing). 0 is reserved for connection-level
+frames.</li>
+</ul>
+<h2 id="unknown-frames-the-rule-that-leaves-room-for-version-2">3.
+Unknown frames (the rule that leaves room for version 2)</h2>
+<p><strong>A receiver that reads a frame whose Type it does not know
+MUST skip it cleanly.</strong> It reads and discards exactly Length
+payload bytes and then carries on with the next frame. It MUST NOT
+answer with an error, close the connection, or change any request state.
+The rule applies on every stream, stream 0 included, and also between
+the frames of a request or response. Because every frame states its own
+length, a v1 peer can always resynchronise past features it has never
+heard of.</p>
+<h2 id="messages">4. Messages</h2>
+<p>A <strong>request</strong> is one HEADERS frame followed by zero or
+more DATA frames. A <strong>response</strong> is the same thing, on the
+same Stream ID. END_STREAM marks the last frame. A message with no body
+is a single HEADERS frame with END_STREAM set. The whole header block
+MUST fit in one HEADERS frame, and receivers MUST accept header blocks
+up to 65 536 bytes. DATA payloads are opaque bytes. Senders SHOULD keep
+each DATA frame at 16 384 bytes or fewer, and receivers MUST accept any
+length. END_STREAM, not <code>content-length</code>, decides where a
+body ends.</p>
+<h2 id="header-block-encoding">5. Header block encoding</h2>
+<p>The payload of a HEADERS frame is a list of fields with no count and
+no terminator; the frame Length bounds it.</p>
+<pre><code>field  = tag:1  [ string ]   string        ; name string present only when tag = 0
+string = len  bytes
+len    = 0xxxxxxx                          ; 0 … 127, one byte
+       | 1xxxxxxx xxxxxxxx                 ; 0 … 32 767, two bytes (15 bits)</code></pre>
+<p><strong>tag = 0</strong> means a literal name follows. <strong>tag
+1–10</strong> names a field from the static table below. These are the
+ten names BHTTP/1 actually sends. Tags 11–255 are reserved; a v1
+receiver treats them as malformed.</p>
+<table style="width:100%;">
+<colgroup>
+<col style="width: 6%" />
+<col style="width: 13%" />
+<col style="width: 6%" />
+<col style="width: 13%" />
+<col style="width: 6%" />
+<col style="width: 13%" />
+<col style="width: 6%" />
+<col style="width: 13%" />
+<col style="width: 6%" />
+<col style="width: 13%" />
+</colgroup>
+<thead>
+<tr>
+<th>#</th>
+<th>name</th>
+<th>#</th>
+<th>name</th>
+<th>#</th>
+<th>name</th>
+<th>#</th>
+<th>name</th>
+<th>#</th>
+<th>name</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>1</td>
+<td><code>:method</code></td>
+<td>3</td>
+<td><code>:status</code></td>
+<td>5</td>
+<td><code>user-agent</code></td>
+<td>7</td>
+<td><code>server</code></td>
+<td>9</td>
+<td><code>content-type</code></td>
+</tr>
+<tr>
+<td>2</td>
+<td><code>:path</code></td>
+<td>4</td>
+<td><code>host</code></td>
+<td>6</td>
+<td><code>accept</code></td>
+<td>8</td>
+<td><code>date</code></td>
+<td>10</td>
+<td><code>content-length</code></td>
+</tr>
+</tbody>
+</table>
+<p>Names are lowercase visible ASCII (0x21–0x7E). Pseudo-header names
+begin with <code>:</code>, MUST be sent through the table and MUST NOT
+appear as literals. Values MUST NOT contain NUL, CR or LF. A request
+carries exactly one <code>:method</code> and one <code>:path</code>, and
+the <code>:path</code> begins with <code>/</code>. A response carries
+exactly one <code>:status</code> as three ASCII digits.</p>
+<h2 id="server-behaviour">6. Server behaviour</h2>
+<p>The server percent-decodes <code>:path</code>, drops any
+<code>?query</code>/<code>#fragment</code> and maps the result under its
+document root. A path ending in <code>/</code>, or naming a directory,
+maps to <code>index.html</code>. It answers <code>200</code> with the
+file as DATA frames, plus <code>content-type</code>,
+<code>content-length</code>, <code>server</code> and <code>date</code>.
+<code>HEAD</code> gets the same headers with no body. Errors carry a
+short <code>text/plain</code> body.</p>
+<table>
+<colgroup>
+<col style="width: 50%" />
+<col style="width: 50%" />
+</colgroup>
+<thead>
+<tr>
+<th>status</th>
+<th>when</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>400</td>
+<td>malformed request: bad header block, reserved tag, missing or
+duplicate pseudo-headers, header block over 64 KiB</td>
+</tr>
+<tr>
+<td>403</td>
+<td>path contains a <code>..</code> segment, or resolves (via symlinks)
+outside the root</td>
+</tr>
+<tr>
+<td>404</td>
+<td>no regular file at that path</td>
+</tr>
+<tr>
+<td>405</td>
+<td>method other than GET / HEAD</td>
+</tr>
+</tbody>
+</table>
+<p><strong>Stream errors</strong> (everything above) get a response, and
+<strong>the connection stays open</strong>. <strong>Connection
+errors</strong> are cases where the frame sequence itself can no longer
+be trusted: a HEADERS frame whose Stream ID is 0 or not greater than the
+previous one, DATA outside an open request, or a frame cut short by EOF.
+For these the server answers <code>400</code> on that Stream ID if it
+still can, and then closes the connection. A request body, if one is
+sent, is read and discarded.</p>
+<h2 id="client-behaviour-bcurl">7. Client behaviour
+(<code>bcurl</code>)</h2>
+<p>The client sends one request at a time and reads the full response
+before sending the next. It writes response bodies to stdout. With
+<code>-v</code> it hexdumps every frame it sends (<code>&gt;</code>) and
+receives (<code>&lt;</code>) to stderr. Exit status: <strong>0</strong>
+if every response was 1xx–3xx, <strong>4</strong> if any was 4xx,
+<strong>5</strong> if any was 5xx, <strong>3</strong> on a protocol
+error, <strong>2</strong> if it could not connect, <strong>1</strong> on
+bad usage.</p>
+<h2 id="why-these-widths-and-why-http2-chose-24-8-8-31">8. Why these
+widths (and why HTTP/2 chose 24 / 8 / 8 / 31)</h2>
+<p>HTTP/2 multiplexes many concurrent streams, so it needs a large
+stream space. Client and server both open streams, split between odd and
+even IDs, which costs a bit. The top bit is reserved so the ID still
+fits a signed 32-bit integer, as in Java. That gives 31 bits. Its 24-bit
+length allows frames up to 16 MiB but defaults to 16 KiB, and the header
+stays at 9 bytes. One type byte and one flags byte cover all of its
+frame types and their per-frame booleans.</p>
+<p><strong>BHTTP/1 keeps 24 / 8 / 8 and shrinks the Stream ID to 24
+bits</strong>, which makes the header exactly <strong>8 bytes</strong>:
+one aligned 64-bit word.</p>
+<ul>
+<li><strong>Length 24</strong>: a 16-bit length would cap frames at 64
+KiB. 24 bits costs one byte and matches HTTP/2. Receivers stream DATA
+instead of buffering whole frames, so a large Length costs no memory,
+and header blocks have their own 64 KiB cap.</li>
+<li><strong>Type 8</strong>: v1 uses 2 of 256 values. Together with §3
+that leaves 254 types for later versions.</li>
+<li><strong>Flags 8</strong>: v1 uses 1 bit. The other 7 are free for
+later versions, and receivers ignore them for now.</li>
+<li><strong>Stream 24</strong>: v1 does not multiplex, so the ID only
+correlates a response with its request. That allows 16.7 M requests per
+connection, more than any keep-alive will use. Because the field already
+exists, a v2 can add pipelining or multiplexing without changing the
+header.</li>
+</ul>
+<p><strong>Headers.</strong> Two of HPACK’s mechanisms: an index for the
+names we actually send, and length-prefixed literals for everything
+else. HPACK’s dynamic table and Huffman coding are left out. A typical
+request is 57 bytes on the wire (8-byte header plus a 49-byte block).
+The same request in HTTP/1.1 text is 85 bytes.</p>
+<p><strong>Evolving.</strong> A v2 that wants new frame types or table
+entries first sends a new frame type, e.g. <code>SETTINGS</code>. A v1
+peer skips it (§3) and never acknowledges it, so both sides stay on v1
+and nothing breaks.</p>
+</body>
+</html>
