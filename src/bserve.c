@@ -174,8 +174,8 @@ static int inside_root(const char *real)
  * outside the root? Follows a dangling symlink's target and otherwise the
  * longest existing prefix, so a 404 never confirms anything out there.
  * Iterative with heap buffers, so a path full of slashes cannot exhaust
- * the stack; a symlink loop or a chain of more than 8 links counts as
- * unresolvable (404), as SPEC §6 says. */
+ * the stack. A symlink loop, or a chain of more than 8 dangling links,
+ * counts as unresolvable (404). */
 static int leads_outside(const char *start)
 {
     size_t cap = PATH_MAX + BH_MAX_PATH + 16;
@@ -212,8 +212,12 @@ static int leads_outside(const char *start)
         char *slash = strrchr(path, '/');
         while (slash && slash > path && slash[-1] == '/')
             slash--;
-        if (!slash || slash == path)
+        if (!slash)
             break;
+        if (slash == path) {            /* only "/" exists: outside unless the root is "/" */
+            result = strlen(g_root) > 1;
+            break;
+        }
         *slash = '\0';
     }
 out:
@@ -603,6 +607,9 @@ int main(int argc, char **argv)
         struct sockaddr_storage ss;
         socklen_t sl = sizeof ss;
         int cfd = accept(lfd, (struct sockaddr *)&ss, &sl);
+        pid_t done;
+        while ((done = waitpid(-1, NULL, WNOHANG)) > 0)   /* also after SIGCHLD's EINTR */
+            forget_child(done);
         if (cfd < 0) {
             if (errno != EINTR)
                 perror("bserve: accept");
@@ -610,11 +617,8 @@ int main(int argc, char **argv)
                 usleep(100000);     /* out of descriptors: back off, don't spin */
             continue;
         }
-        /* Reap whatever has finished (never blocking, so one busy client
-         * cannot stall accept for everyone), then apply the caps. */
-        pid_t done;
-        while ((done = waitpid(-1, NULL, WNOHANG)) > 0)
-            forget_child(done);
+        /* Children were reaped above without blocking, so one busy client
+         * cannot stall accept for everyone. Now apply the caps. */
         char addr[INET6_ADDRSTRLEN];
         peer_addr(&ss, addr, sizeof addr);
         if (g_nchild >= MAX_CHILDREN || count_client(addr) >= MAX_PER_CLIENT) {

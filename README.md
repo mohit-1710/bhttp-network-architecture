@@ -13,7 +13,7 @@
 
 ## Architecture
 
-bserve and bcurl talk only over TCP, using the format in [SPEC.md](SPEC.md). Purple marks the four parts I spent the most design time on (the header and table choices are argued under Design decisions): the 8-byte header, skipping unknown frame types, the 10-name static table, and keeping paths inside the root.
+bserve and bcurl talk only over TCP, using the format in [SPEC.md](SPEC.md). The purple boxes are where most of my design time went.
 
 ```mermaid
 flowchart LR
@@ -117,10 +117,10 @@ Ten common names (`:method`, `:path`, `:status`, `host`, `user-agent`, `accept`,
 
 ## What bserve and bcurl do
 
-| Feature | What it does |
+| Area | Behaviour |
 |---|---|
 | Server (Track 1) | `bserve ./www 9000` reads binary frames, maps `:path` under the root, answers `200` with the file as DATA frames, or 400, 403, 404 or 405 as listed in SPEC §6. |
-| Client (Track 2) | `bcurl -v localhost:9000/index.html` builds the request frame, writes the body to stdout, hexdumps every frame with `-v`, exits 4 on 4xx and 5 on 5xx, and sends any extra paths on the same connection. |
+| Client (Track 2) | `bcurl -v localhost:9000/index.html` builds the request frame, writes the body to stdout, hexdumps every frame with `-v`, exits non-zero on 4xx and 5xx, and sends any extra paths on the same connection. |
 | Unknown frames | Both sides skip frame types they do not know, on any stream and between any two frames. `--grease` sends a type `0xFA` frame first, to check that the server skips it. |
 | Path safety | `..` gives 403. Dotfiles, FIFOs and other non-regular files give 404, even through a symlink. Symlinks must resolve inside the root, and a missing file behind an outside link is 403, not 404. |
 | Timeouts and caps | Idle and request deadlines, a per-frame deadline in each direction (see Run), 128 connections in all and 32 per client address. |
@@ -137,10 +137,10 @@ Ten common names (`:method`, `:path`, `:status`, `host`, `user-agent`, `accept`,
 | Stream ID | 24 bits, client counts 1, 2, 3 | none at all (no way to spot a stale frame); odd/even split (no server-started streams in v1) |
 | Header names | 10-entry static table + literals | HPACK's dynamic table and Huffman coding: the Huffman code table alone has 257 entries, for a few bytes saved on a 57-byte request |
 | String lengths | 1 byte below 128, else 2 bytes with the top bit set | fixed 2-byte lengths (a byte wasted on almost every field); HPACK prefix integers |
-| End of body | END_STREAM, checked against `content-length` | `content-length` alone (can't stream unknown sizes); END_STREAM alone (can't detect a cut-off body) |
+| End of body | END_STREAM, checked against `content-length` | either alone: without END_STREAM a sender cannot stream a body of unknown size, and without the length check a cut-off body looks complete |
 | Version 2 | new frame types, negotiated by a frame v1 skips | a version byte in every header; a connection preface |
 
-Background on HTTP/2's header and its 8-byte drafts: SPEC §8.
+SPEC §8 has the longer argument, including why HTTP/2's own drafts used 8 bytes.
 
 ---
 
@@ -154,7 +154,7 @@ Apple M5 Pro, loopback, release build (`make`); times are the middle of three ru
 | 10 000 requests over one connection, one at a time | 0.52 s, 19 000 requests/s (52 µs each) |
 | 200 MB file, 12 208 DATA frames | 0.095 s, 2.1 GB/s, byte-identical |
 | Framing overhead on a full DATA frame | 8 / 16 392 bytes = 0.05 % |
-| Tests (C programs against a separate Python implementation) | 110 passing on Ubuntu and macOS, and again under ASan and UBSan ([CI](.github/workflows/ci.yml)) |
+| Tests (C programs against a separate Python implementation) | 111 passing on Ubuntu and macOS, and again under ASan and UBSan ([CI](.github/workflows/ci.yml)) |
 | Header-block fuzzing (`make fuzz`, under ASan and UBSan) | 300 000 mutated blocks, no crashes |
 
 ---
@@ -177,7 +177,7 @@ make test                                              # the interop tests
 
 | Program | Options |
 |---|---|
-| `bserve [-v] [-t seconds] <root> <port>` | `-v` hexdumps frames on the server side. `-t` (default 30) is the idle wait for the next request, the time allowed to receive a started request, and the time the client has to take each frame. The tests use `-t 2`. |
+| `bserve [-v] [-t seconds] <root> <port>` | `-v` hexdumps frames on the server side. `-t` (default 30) sets the server's idle, per-request and per-outgoing-frame deadlines; the tests use `-t 2`. |
 | `bcurl [-v] [-I] [-X method] [-H 'name: value'] [-t seconds] [--grease] url [paths]` | `-v` hexdumps every frame to stderr. `-I` sends HEAD and prints the response headers. `-H host`, `user-agent` or `accept` replace the defaults. `-t` (default 30) is the connect timeout and the time each response frame has to arrive in full; unknown frames do not extend it. |
 
 bcurl exits with 0 when every status is below 400, 4 for a 4xx, 5 for a 5xx, 3 for a protocol, timeout or output error, 2 when it cannot connect and 1 for bad arguments.

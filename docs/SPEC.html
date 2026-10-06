@@ -25,7 +25,7 @@ vertical-align: middle;
 }
 .display.math{display: block; text-align: center; margin: 0.5rem auto;}
 </style>
-  <style type="text/css">@page { size: A4; margin: 12mm 13mm; }
+  <style type="text/css">@page { size: A4; margin: 11mm 13mm; }
 body { font: 9.3pt/1.34 -apple-system, "Helvetica Neue", Arial, sans-serif; color: #111; max-width: none; margin: 0; padding: 0; }
 header#title-block-header { margin-bottom: 4px; border-bottom: 1.5px solid #111; padding-bottom: 3px; }
 h1.title { font-size: 15pt; margin: 0; } p.subtitle { margin: 0; color: #555; font-size: 9pt; }
@@ -59,10 +59,10 @@ completely before answering it. A server MAY refuse a connection by
 closing it at once; otherwise it closes only after a connection error
 (§6), after a body it cannot finish (§4), when a request takes too long
 to arrive or the client stops taking response frames, or when no request
-has been in progress for a while (at least 10 s RECOMMENDED; unknown
-frames do not count as activity). Unless a body fails or the client
-stops taking frames, it never closes with a fully received request
-unanswered, so a request with no response was not processed.</p>
+has been in progress for a while (unknown frames do not count as
+activity); each such limit SHOULD be at least 10 s. Unless a body fails
+or the client stops taking frames, it never closes with a fully received
+request unanswered, so a request with no response was not processed.</p>
 <h2 id="frame-header">2. Frame header</h2>
 <p>Every frame is an 8-byte header followed by Length bytes of
 payload.</p>
@@ -192,15 +192,15 @@ receivers accept both.</li>
 <code>:path</code>, <code>:status</code>, <code>host</code> and
 <code>content-length</code> appear at most once each, counted by name
 whether sent by tag or literal; other names may repeat.</li>
-<li>A request has one <code>:method</code>, a case-sensitive HTTP token,
-and one <code>:path</code>, starting with <code>/</code> and at most
-1024 bytes as sent. It has no <code>:status</code>; <code>host</code>
-SHOULD be sent.</li>
+<li>A request has one <code>:method</code> (a case-sensitive HTTP token)
+and one <code>:path</code> (starting with <code>/</code>, at most 1024
+bytes as sent), no <code>:status</code>, and SHOULD have
+<code>host</code>.</li>
 <li>A response has one <code>:status</code>, three ASCII digits from 200
 to 599, and no <code>:method</code> or <code>:path</code>. v1 has no 1xx
 responses.</li>
-<li>A block breaking any rule here (SHOULDs aside), using tags 11 to
-255, or with a length past the payload is malformed.</li>
+<li>A block is malformed if it breaks a rule here (bar SHOULDs and
+sender rules), uses tags 11 to 255, or overruns the payload.</li>
 </ul>
 <h2 id="server">6. Server</h2>
 <p>The server cuts <code>:path</code> at the first <code>?</code> or
@@ -253,8 +253,8 @@ resolved means symlinks followed.</p>
 <tr>
 <td>5</td>
 <td>403</td>
-<td>the resolved path, or its existing part, is outside the root, or the
-server may not read it</td>
+<td>the resolved path, or the longest existing part of it, is outside
+the root</td>
 </tr>
 <tr>
 <td>6</td>
@@ -264,6 +264,11 @@ included), a resolved dot component, or not a regular file</td>
 </tr>
 <tr>
 <td>7</td>
+<td>403</td>
+<td>the server may not read the file</td>
+</tr>
+<tr>
+<td>8</td>
 <td>500</td>
 <td>the file cannot be opened or read for any other reason</td>
 </tr>
@@ -285,21 +290,20 @@ stream 0, at any point, starts a connection-error message; the client
 reads it and its DATA, reports the reason and stops. These are protocol
 errors, after which the client closes the connection: a HEADERS or DATA
 frame for any stream other than the oldest unanswered request; DATA
-before HEADERS or after END_STREAM; a second HEADERS in one response;
-DATA in a response to HEAD; a malformed or oversized response header
-block; a <code>content-length</code> mismatch; EOF while a response is
-unfinished; and a read timeout.</p>
+before HEADERS or after END_STREAM; a second HEADERS in one response; a
+HEAD response that is not a single HEADERS frame with END_STREAM; a
+malformed or oversized response block; a <code>content-length</code>
+mismatch; EOF mid-response; and a read timeout.</p>
 <h2 id="design-notes">8. Design notes</h2>
 <p>HTTP/2&#39;s header is Length 24, Type 8, Flags 8, then a reserved bit
-and a 31-bit Stream ID: 9 bytes. Its drafts used 8 bytes (a 16-bit
-Length in draft 04, 14 bits plus two reserved bits in draft 13) until
-draft 14 (2014) widened Length to 24 bits, letting a receiver opt in to
-larger frames. The 2¹⁴ default stops one big frame delaying the others.
-Flags are defined per frame type, so 8 bits are enough. The 31-bit
-Stream ID is a 32-bit word minus a reserved bit with no meaning (RFC
-9113 §4.1); both ends start streams (client odd, server even), giving
-the client 2³⁰ IDs and the server 2³⁰ − 1. BHTTP/1 uses 24 / 8 / 8 /
-24:</p>
+and a 31-bit Stream ID: 9 bytes. Its drafts used 8 bytes like BHTTP/1
+(16-bit Length in draft 04; 14 bits after two reserved bits in draft 13)
+until draft 14 (2014) widened Length to 24 bits for opt-in larger
+frames. The 2¹⁴ default stops one big frame delaying the others. Flags
+are defined per frame type, so 8 bits are enough. The 31-bit Stream ID
+is a 32-bit word minus a reserved bit with no meaning (RFC 9113 §4.1);
+both ends start streams (client odd, server even), giving the client 2³⁰
+IDs and the server 2³⁰ − 1. BHTTP/1 uses 24 / 8 / 8 / 24:</p>
 <ul>
 <li>Length 24. v1&#39;s sizes (16 KiB DATA recommended, header blocks at
 most 64 KiB − 1) fit in 16 bits; the extra byte allows larger frames now
@@ -320,12 +324,10 @@ use.</li>
 <p>From HPACK (static and dynamic tables, Huffman coding, prefix-coded
 integers) BHTTP/1 takes two ideas: names from a fixed table (HPACK&#39;s
 &quot;literal with indexed name&quot;) and length-prefixed literals. It indexes
-names only, as values like paths and dates change on every message.</p>
-<p>With no preface, a misdirected HTTP/1.1 <code>GET /</code> reads as
-an unknown frame of Length 0x474554 and is skipped until the idle limit,
-a slow failure v1 accepts. To grow, a v2 client sends a new frame type,
-say HELLO, before a first request that is plain v1. A v2 server answers
-with its own HELLO before that response; a v1 server skips it, so a
-response with no HELLO before it means v1.</p>
+names only, as the brief asks.</p>
+<p>With no preface, a stray HTTP/1.1 <code>GET /</code> reads as an
+unknown frame of Length 0x474554, skipped until the idle limit. To grow,
+a v2 client sends a new HELLO frame with a plain-v1 first request; a v2
+server answers HELLO first, a v1 server skips it.</p>
 </body>
 </html>

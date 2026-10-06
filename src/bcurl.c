@@ -301,6 +301,7 @@ static void report_connection_error(int fd, const bh_frame *f)
     size_t used = 0;
     int end = f->flags & BH_FLAG_END_STREAM;
     bh_frame d;
+    int cut = 0;
     while (!end && bh_next_frame(fd, &d, g_trace) == 0 && d.type == BH_DATA && d.stream == 0) {
         /* Keep what fits of the reason; read and drop the rest. */
         uint8_t *buf = malloc(d.length ? d.length : 1);
@@ -309,6 +310,7 @@ static void report_connection_error(int fd, const bh_frame *f)
             break;
         }
         size_t take = d.length < sizeof msg - 1 - used ? d.length : sizeof msg - 1 - used;
+        cut |= take < d.length;
         memcpy(msg + used, buf, take);
         used += take;
         free(buf);
@@ -316,7 +318,7 @@ static void report_connection_error(int fd, const bh_frame *f)
     }
     msg[used] = '\0';
     fprintf(stderr, "bcurl: server reported a connection error: %s%s\n",
-            bh_escape(msg, safe, sizeof safe), used == sizeof msg - 1 ? " ...(truncated)" : "");
+            bh_escape(msg, safe, sizeof safe), cut || !end ? " ...(truncated)" : "");
 }
 
 /* Read one response on stream sid. Returns the status code, or -1. */

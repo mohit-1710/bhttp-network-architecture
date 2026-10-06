@@ -2,9 +2,8 @@
 """
 Interop tests for BHTTP/1.
 
-A second implementation of SPEC.md in Python, sharing no code with src/. It
-plays client against ./bserve and server against ./bcurl, so a mistake made
-the same way in bserve.c and bcurl.c still shows up as a failure.
+Second implementation of SPEC.md in Python, sharing no code with src/; it
+plays client against ./bserve and server against ./bcurl.
 
     python3 tests/interop.py          (run from the repo root, after `make`)
 """
@@ -429,20 +428,23 @@ def test_root_and_timeouts():
                   recv_response(s, 10)[0] == 403)
             request(s, 11, "/dangling")
             check("dangling symlink pointing outside the root -> 403", recv_response(s, 11)[0] == 403)
-            request(s, 12, "/up")
-            check("symlink to a directory outside the root -> 403", recv_response(s, 12)[0] == 403)
-            request(s, 13, "/pipe")
+            os.symlink("/no-such-top-level-dir-bhttp", os.path.join(root, "dang-top"))
+            request(s, 12, "/dang-top")
+            check("dangling symlink to a missing top-level path -> 403", recv_response(s, 12)[0] == 403)
+            request(s, 120, "/up")
+            check("symlink to a directory outside the root -> 403", recv_response(s, 120)[0] == 403)
+            request(s, 130, "/pipe")
             s.settimeout(3)
-            check("FIFO in the root -> 404 at once, not a hang", recv_response(s, 13)[0] == 404)
+            check("FIFO in the root -> 404 at once, not a hang", recv_response(s, 130)[0] == 404)
             os.symlink("loop-b", os.path.join(root, "loop-a"))
             os.symlink("loop-a", os.path.join(root, "loop-b"))
-            request(s, 14, "/loop-a")
-            check("symlink loop inside the root -> 404", recv_response(s, 14)[0] == 404)
-            request(s, 15, "/x" + "/" * 1000)
+            request(s, 140, "/loop-a")
+            check("symlink loop inside the root -> 404", recv_response(s, 140)[0] == 404)
+            request(s, 150, "/x" + "/" * 1000)
             check("missing path made of 1000 slashes -> 404, worker survives",
-                  recv_response(s, 15)[0] == 404)
-            request(s, 16, "/x/" * 300 + "y")
-            check("missing path with 300 segments -> 404", recv_response(s, 16)[0] == 404)
+                  recv_response(s, 150)[0] == 404)
+            request(s, 160, "/x/" * 300 + "y")
+            check("missing path with 300 segments -> 404", recv_response(s, 160)[0] == 404)
             s.settimeout(None)
             s.close()
 
@@ -561,7 +563,7 @@ class FakeServer:
             pass
 
     def empties(self, c, sid):
-        """Start a response, then send an empty DATA frame every 0.4 s, forever-ish."""
+        """Start a response, then send an empty DATA frame every 0.4 s until bcurl gives up."""
         try:
             c.sendall(frame(HEADERS, 0, sid, enc_headers([(":status", "200")])))
             for _ in range(40):
