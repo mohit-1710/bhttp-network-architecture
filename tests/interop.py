@@ -840,6 +840,10 @@ def test_end_to_end():
               r.returncode == 0 and r.stdout == open(os.path.join(WWW, "index.html"), "rb").read())
         r = bcurl(f"localhost:{port}/missing")
         check("404 -> exit 4", r.returncode == 4)
+        r = bcurl("-I", f"localhost:{port}/%zz")
+        check("HEAD that bserve answers with a header-only 400 -> exit 4", r.returncode == 4, r.stderr)
+        r = bcurl("-I", f"localhost:{port}/missing")
+        check("HEAD for a missing file -> exit 4", r.returncode == 4, r.stderr)
     finally:
         srv.terminate()
         srv.wait()

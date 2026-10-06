@@ -431,7 +431,9 @@ static int read_response(int fd, uint32_t sid, int head, int show_headers)
         return -1;
     }
     /* A HEAD response describes the body it did not send. */
-    if ((!head || status == 400) && want >= 0 && got != want) {
+    /* A HEAD response's content-length describes the body it did not send;
+     * only a 400 that actually carried DATA is checked against it. */
+    if ((!head || got > 0) && want >= 0 && got != want) {
         fprintf(stderr, "bcurl: body is %lld bytes but content-length said %lld\n", got, want);
         return -1;
     }

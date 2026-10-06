@@ -154,7 +154,7 @@ Apple M5 Pro, loopback, release build (`make`); times are the middle of three ru
 | 10 000 requests over one connection, one at a time | 0.52 s, 19 000 requests/s (52 µs each) |
 | 200 MB file, 12 208 DATA frames | 0.095 s, 2.1 GB/s, byte-identical |
 | Framing overhead on a full DATA frame | 8 / 16 392 bytes = 0.05 % |
-| Tests (C programs against a separate Python implementation) | 114 passing on Ubuntu and macOS, and again under ASan and UBSan ([CI](.github/workflows/ci.yml)) |
+| Tests (C programs against a separate Python implementation) | 116 passing on Ubuntu and macOS, and again under ASan and UBSan ([CI](.github/workflows/ci.yml)) |
 | Header-block fuzzing (`make fuzz`, under ASan and UBSan) | 300 000 mutated blocks, no crashes |
 
 ---
