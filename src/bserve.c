@@ -306,9 +306,11 @@ static void connection_error(int fd, const char *why)
 {
     send_error(fd, 0, 400, why, 0);
     shutdown(fd, SHUT_WR);
+    /* Every read waits through bh_read_full, so the 2 s deadline holds even
+     * if the client sends one more byte and then goes quiet. */
     bh_set_deadline(2);
-    char junk[4096];
-    while (bh_read_full(fd, junk, 1) == 0 && read(fd, junk, sizeof junk) > 0)
+    char junk[1];
+    while (bh_read_full(fd, junk, 1) == 0)
         ;
 }
 

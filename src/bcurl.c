@@ -36,7 +36,8 @@
 enum { EX_OK = 0, EX_USAGE = 1, EX_CONNECT = 2, EX_PROTO = 3, EX_4XX = 4, EX_5XX = 5 };
 
 static FILE *g_trace;
-static int   g_timeout = 30;        /* -t: s to connect, and s without any bytes */
+static int   g_timeout = 30;        /* -t: connect timeout, and the time each response
+                                       frame has to arrive in full */
 
 static void usage(void)
 {
@@ -535,5 +536,11 @@ int main(int argc, char **argv)
     close(fd);
     if (g_trace)
         fprintf(g_trace, "* connection closed, exit %d\n", rc);
+    for (int i = 0; i < o.nextra; i++) {
+        free(o.names[i]);
+        free((char *)o.values[i]);
+    }
+    free(ts);
+    free(urls);
     return rc;
 }

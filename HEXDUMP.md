@@ -1,6 +1,6 @@
-# Annotated hexdumps: a GET, a 404, a 400 and a skipped frame
+# Annotated hexdumps: a GET, a 404, a skipped frame and a 400
 
-This is one exchange between `./bcurl` and `./bserve ./www 9000`. The request asks for `/hello.txt`, a 20-byte file containing `Hello, binary HTTP!\n`. I added one header that is not in the static table (`-H 'x-trace-id: 7f3a'`) so the dump also shows a literal name:
+The first section is a single GET between `./bcurl` and `./bserve ./www 9000`; later sections show a 404, a skipped frame and a 400, in that order. The request asks for `/hello.txt`, a 20-byte file containing `Hello, binary HTTP!\n`. I added one header that is not in the static table (`-H 'x-trace-id: 7f3a'`) so the dump also shows a literal name:
 
 ```
 ./bcurl -v -H 'x-trace-id: 7f3a' localhost:9000/hello.txt
@@ -8,7 +8,7 @@ This is one exchange between `./bcurl` and `./bserve ./www 9000`. The request as
 
 On the wire there are three frames and 189 bytes: a 74-byte request and a 115-byte response.
 
-Table offsets are payload offsets, as in the `-v` output: offset 0x00 is byte 8 of the frame. Every capture's `-v` output is included unedited.
+Table offsets are payload offsets, as in the `-v` output: offset 0x00 is byte 8 of the frame.
 
 ## Request, client to server (one frame, 8 + 66 bytes)
 
@@ -116,7 +116,7 @@ Every string above is shorter than 128 bytes, so each length took one byte with 
 | payload 0x4b | `0a 03 31 35 35` | tag 10 `content-length`, length 3, `155` (ends at 0x4f, the 80th byte) |
 | response DATA | `00 00 9b 00 01 00 00 01` | Length 0x9b = 155, DATA, END_STREAM, stream 1: `404 Not Found\n` plus the path and a newline (14 + 140 + 1) |
 
-bcurl wrote the 155-byte body to stdout and exited with 4 because the status was 4xx. A second path on the same command line would have gone out as stream 2.
+bcurl wrote the 155-byte body to stdout and exited with 4 because the status was 4xx.
 
 ```
 * connected to localhost port 9000 (BHTTP/1)
@@ -214,12 +214,13 @@ bcurl wrote the 155-byte body to stdout and exited with 4 because the status was
 
 ## A 400, seen from the server
 
-A malformed request needs a hand-made frame, since bcurl only sends valid ones. This is `bserve -v`'s view (`<` received, `>` sent) of a client that sent `00 00 08 01 01 00 00 01` followed by `01 03 47 45 54 0b 01 78`: tag 1 `:method` `GET`, then tag `0b`, which v1 does not define (§5).
+A malformed request needs a hand-made frame, since bcurl only sends valid ones. This is the view from `bserve -v ./www 9000` (`<` received, `>` sent) of a client that sent a valid `:method` and `:path` followed by tag `0b`, which v1 does not define (§5).
 
 | bytes | meaning |
 |---|---|
-| `00 00 08 01 01 00 00 01` | HEADERS, Length 8, END_STREAM, stream 1 |
+| `00 00 11 01 01 00 00 01` | HEADERS, Length 0x11 = 17, END_STREAM, stream 1 |
 | `01 03 47 45 54` | tag 1 `:method`, length 3, `GET` |
+| `02 07 2f 68 69 2e 74 78 74` | tag 2 `:path`, length 7, `/hi.txt` |
 | `0b 01 78` | tag 11: undefined, so the whole block is malformed |
 | reply `03 03 34 30 30 …` | `:status` `400` on stream 1, `content-length` 39 |
 | reply DATA, 39 bytes | `400 Bad Request\nmalformed header block\n` |
@@ -227,23 +228,24 @@ A malformed request needs a hand-made frame, since bcurl only sends valid ones. 
 It is a stream error, so bserve answers on stream 1 and keeps reading; the connection closes only when the client hangs up.
 
 ```
-bserve: serving /Users/mohit/sst/network_architecture/www on port 9002 (BHTTP/1)
-[bserve 91842] ::ffff:127.0.0.1:57713 connected
-< HEADERS frame  length=8 type=0x01 flags=0x01 [END_STREAM] stream=1
-<   header  00 00 08 | 01 | 01 | 00 00 01    (length | type | flags | stream)
-<   000000  01 03 47 45 54 0b 01 78                           |..GET..x|
+bserve: serving /Users/mohit/sst/network_architecture/www on port 9000 (BHTTP/1)
+[bserve 96787] 127.0.0.1:61301 connected
+< HEADERS frame  length=17 type=0x01 flags=0x01 [END_STREAM] stream=1
+<   header  00 00 11 | 01 | 01 | 00 00 01    (length | type | flags | stream)
+<   000000  01 03 47 45 54 02 07 2f  68 69 2e 74 78 74 0b 01  |..GET../hi.txt..|
+<   000010  78                                                |x|
 <   (malformed header block)
-[bserve 91842] ::ffff:127.0.0.1:57713 stream=1 -> 400 (malformed header block)
+[bserve 96787] 127.0.0.1:61301 stream=1 -> 400 (malformed header block)
 > HEADERS frame  length=79 type=0x01 flags=0x00 stream=1
 >   header  00 00 4f | 01 | 00 | 00 00 01    (length | type | flags | stream)
 >   000000  03 03 34 30 30 07 0a 62  73 65 72 76 65 2f 31 2e  |..400..bserve/1.|
 >   000010  30 08 1d 54 75 65 2c 20  30 36 20 4f 63 74 20 32  |0..Tue, 06 Oct 2|
->   000020  30 32 36 20 32 31 3a 34  31 3a 33 30 20 47 4d 54  |026 21:41:30 GMT|
+>   000020  30 32 36 20 32 31 3a 35  39 3a 32 36 20 47 4d 54  |026 21:59:26 GMT|
 >   000030  09 19 74 65 78 74 2f 70  6c 61 69 6e 3b 20 63 68  |..text/plain; ch|
 >   000040  61 72 73 65 74 3d 75 74  66 2d 38 0a 02 33 39     |arset=utf-8..39|
 >     [#3 ] :status: 400
 >     [#7 ] server: bserve/1.0
->     [#8 ] date: Tue, 06 Oct 2026 21:41:30 GMT
+>     [#8 ] date: Tue, 06 Oct 2026 21:59:26 GMT
 >     [#9 ] content-type: text/plain; charset=utf-8
 >     [#10] content-length: 39
 > DATA frame  length=39 type=0x00 flags=0x01 [END_STREAM] stream=1
@@ -251,7 +253,7 @@ bserve: serving /Users/mohit/sst/network_architecture/www on port 9002 (BHTTP/1)
 >   000000  34 30 30 20 42 61 64 20  52 65 71 75 65 73 74 0a  |400 Bad Request.|
 >   000010  6d 61 6c 66 6f 72 6d 65  64 20 68 65 61 64 65 72  |malformed header|
 >   000020  20 62 6c 6f 63 6b 0a                              | block.|
-[bserve 91842] ::ffff:127.0.0.1:57713 client closed connection
+[bserve 96787] 127.0.0.1:61301 client closed connection
 ```
 
 ## Raw `-v` output of the first exchange

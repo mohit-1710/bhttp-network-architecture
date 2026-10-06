@@ -48,7 +48,6 @@ void bh_unpack_header(const uint8_t in[BH_FRAME_HEADER_LEN], bh_frame *f);
 void bh_set_deadline(int seconds);
 long long bh_now_ms(void);              /* monotonic clock */
 int bh_read_full(int fd, void *buf, size_t n);
-int bh_write_full(int fd, const void *buf, size_t n);
 
 /* Send one frame. If trace != NULL, hexdump it there with the given direction marker.
  * With a frame timeout set, a frame the peer has not taken within that many

@@ -108,21 +108,6 @@ int bh_read_full(int fd, void *buf, size_t n)
     return 0;
 }
 
-int bh_write_full(int fd, const void *buf, size_t n)
-{
-    size_t put = 0;
-    while (put < n) {
-        ssize_t w = write(fd, (const char *)buf + put, n - put);
-        if (w < 0) {
-            if (errno == EINTR)
-                continue;
-            return -1;
-        }
-        put += (size_t)w;
-    }
-    return 0;
-}
-
 int bh_send_frame(int fd, uint8_t type, uint8_t flags, uint32_t stream,
                   const void *payload, uint32_t len, FILE *trace)
 {

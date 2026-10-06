@@ -1,6 +1,6 @@
 # bhttp-network-architecture
 
-> BHTTP/1 is a binary framing for HTTP requests. This repo has its two-page spec, a file server (`bserve`), a client (`bcurl`) and an annotated hexdump of one exchange. Frames have an 8-byte header, header names are either one of 10 table tags or a literal, and receivers skip unknown frame types so that a v2 can add new ones.
+> BHTTP/1 is a binary framing for HTTP requests. This repo has its spec, a file server (`bserve`), a client (`bcurl`) and annotated hexdumps of real exchanges.
 
 ![C11](https://img.shields.io/badge/C11-6f4cff?style=flat-square&logo=c&logoColor=white)
 ![POSIX sockets](https://img.shields.io/badge/POSIX%20sockets-6f4cff?style=flat-square&logo=linux&logoColor=white)
@@ -13,7 +13,7 @@
 
 ## Architecture
 
-bserve and bcurl talk only over TCP, using the format in [SPEC.md](SPEC.md) (two pages as [docs/SPEC.pdf](docs/SPEC.pdf)); [HEXDUMP.md](HEXDUMP.md) goes through real exchanges byte by byte. Purple marks the four parts I made real choices about: the 8-byte header, skipping unknown frame types, the 10-name static table, and keeping paths inside the root.
+bserve and bcurl talk only over TCP, using the format in [SPEC.md](SPEC.md); [HEXDUMP.md](HEXDUMP.md) goes through real exchanges byte by byte. Purple marks the four parts where I chose between alternatives (listed under Design decisions): the 8-byte header, skipping unknown frame types, the 10-name static table, and keeping paths inside the root.
 
 ```mermaid
 flowchart LR
@@ -77,13 +77,13 @@ sequenceDiagram
 
 ### Reading a frame
 
-Every receiver, client or server, runs the same loop. Length tells a v1 peer how far to skip, so frame types added in v2 are safe to ignore.
+Client and server both run this loop. An unknown frame costs one read of Length bytes.
 
 ```mermaid
 flowchart TB
     A["read 8 header bytes"] --> B{"Type"}
     B -->|0x00 DATA| D["body bytes for the open stream"]
-    B -->|0x01 HEADERS| H["header block, at most 64 KiB"]
+    B -->|0x01 HEADERS| H["header block, at most 65 535 bytes"]
     B -->|anything else| U["read and discard Length bytes<br/>ignore flags and stream ID"]
     U --> A
     D --> E{"END_STREAM?"}
@@ -119,11 +119,11 @@ Ten common names (`:method`, `:path`, `:status`, `host`, `user-agent`, `accept`,
 
 | Part | What it does |
 |---|---|
-| Track 1: server | `bserve ./www 9000` reads binary frames, maps `:path` under the root, answers `200` with the file as DATA frames, `404` if missing and `400` if malformed. |
+| Track 1: server | `bserve ./www 9000` reads binary frames, maps `:path` under the root, answers `200` with the file as DATA frames, or 400, 403, 404 or 405 as listed in SPEC §6. |
 | Track 2: client | `bcurl -v localhost:9000/index.html` builds the request frame, writes the body to stdout, hexdumps every frame with `-v`, exits 4 on 4xx and 5 on 5xx, and sends any extra paths on the same connection. |
 | Unknown frames | Both sides skip frame types they do not know, on any stream and between any two frames. `--grease` sends a type `0xFA` frame first, to check that the server skips it. |
 | Path safety | `..` gives 403. Dotfiles, FIFOs and other non-regular files give 404, even through a symlink. Symlinks must stay inside the root, including the case of a sibling directory whose name starts with the root's name. |
-| Errors | Stream errors (400, 403, 404, 405) keep the connection; connection errors (stream ID going backwards, stray DATA) get a 400 on stream 0, then a close. |
+| Errors | Stream errors keep the connection; connection errors close it (see the diagram above). |
 | Timeouts and caps | Idle and request deadlines, a per-frame write deadline for slow readers, 128 connections total and 16 per client address. bcurl gives each response frame `-t` seconds, so a server cannot hold it open with unknown frames or trickled bytes. |
 | Truncated bodies | If a file read fails mid-body the server drops the connection instead of sending END_STREAM, and the client checks `content-length` against the bytes received. |
 
@@ -136,7 +136,7 @@ Ten common names (`:method`, `:path`, `:status`, `host`, `user-agent`, `accept`,
 | Header size | 8 bytes: 24 / 8 / 8 / 24 | HTTP/2's 9 bytes with a reserved bit and 31-bit IDs, which only pay off with multiplexing |
 | Length | 24 bits, frames up to 16 MiB | 16 bits: fits v1's limits, but Length can never change later without breaking the skip rule |
 | Stream ID | 24 bits, client counts 1, 2, 3 | none at all (no way to spot a stale frame); odd/even split (no server-started streams in v1) |
-| Header names | 10-entry static table + literals | HPACK's dynamic table and Huffman coding: much more code for small gains on short exchanges |
+| Header names | 10-entry static table + literals | HPACK's dynamic table and Huffman coding (a 257-entry code table), which would add more code than the whole header codec here to save a few bytes on a 57-byte request |
 | String lengths | 1 byte below 128, else 2 bytes with the top bit set | fixed 2-byte lengths (a byte wasted on almost every field); HPACK prefix integers |
 | End of body | END_STREAM, checked against `content-length` | `content-length` alone (can't stream unknown sizes); END_STREAM alone (can't detect a cut-off body) |
 | Version 2 | new frame types, negotiated by a frame v1 skips | a version byte in every header; a connection preface |
@@ -147,15 +147,15 @@ Background on HTTP/2's header and its 8-byte drafts: SPEC §8.
 
 ## Numbers
 
-Apple M5 Pro, loopback, release build (`make`):
+Apple M5 Pro, loopback, release build (`make`); times are the middle of three runs:
 
 | Measurement | Value |
 |---|---|
 | Request for `/hello.txt` on the wire | 57 bytes (HTTP/1.1 text: 85) |
-| 10 000 requests over one connection, one at a time | about 0.52 s, about 19 000 requests/s (52 µs each) |
-| 200 MB file, 12 208 DATA frames | about 0.095 s, about 2.1 GB/s, byte-identical |
+| 10 000 requests over one connection, one at a time | 0.52 s, 19 000 requests/s (52 µs each) |
+| 200 MB file, 12 208 DATA frames | 0.095 s, 2.1 GB/s, byte-identical |
 | Framing overhead on a full DATA frame | 8 / 16 392 bytes = 0.05 % |
-| Tests (C programs against a separate Python implementation) | 99 passing on Ubuntu and macOS, and again under ASan and UBSan ([CI](.github/workflows/ci.yml)) |
+| Tests (C programs against a separate Python implementation) | 100 passing on Ubuntu and macOS, and again under ASan and UBSan ([CI](.github/workflows/ci.yml)) |
 | Header-block fuzzing (`make fuzz`, under ASan and UBSan) | 300 000 mutated blocks, no crashes |
 
 ---
@@ -187,7 +187,7 @@ bcurl exits with 0 when every status is below 400, 4 for a 4xx, 5 for a 5xx, 3 f
 
 ## Tests
 
-[tests/interop.py](tests/interop.py) has its own frame and header-block code, written from SPEC.md rather than from `src/` (its docstring explains why). The cases that took the most work:
+[tests/interop.py](tests/interop.py) has its own frame and header-block code, written from SPEC.md, not copied from `src/`, so a bug shared by bserve and bcurl still fails a test. The cases that took the most work:
 
 - a header block of exactly 65 535 bytes, and one with 300 fields;
 - a slow reader, a slow sender and an idle connection, each cut off by the deadlines;
@@ -206,7 +206,7 @@ bserve's stderr is kept during the run, and the last check fails if it contains 
 
 ```
 SPEC.md                 the protocol (docs/SPEC.pdf: the same text on two pages; docs/build.sh rebuilds it)
-HEXDUMP.md              one request and response annotated byte by byte, plus a 404 and a skipped frame
+HEXDUMP.md              a GET annotated byte by byte, plus a 404, a skipped frame and a 400
 src/bproto.[ch]         frame header, header-block codec, deadlines, -v hexdump
 src/bserve.c            Track 1, the server
 src/bcurl.c             Track 2, the client

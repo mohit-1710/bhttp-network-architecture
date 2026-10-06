@@ -60,9 +60,10 @@ connection by closing it at once; otherwise it closes only after a
 connection error (§6), after a body it cannot finish (§4), when a
 request takes too long to arrive or the client stops taking response
 frames, or when no request has been in progress for a while (at least 10
-s RECOMMENDED; unknown frames do not count as activity). Apart from a
-failed body, it never closes with a fully received request unanswered,
-so a request with no response was not processed.</p>
+s RECOMMENDED; unknown frames do not count as activity). Unless a body
+fails or the client stops taking frames, it never closes with a fully
+received request unanswered, so a request with no response was not
+processed.</p>
 <h2 id="frame-header">2. Frame header</h2>
 <p>Every frame is an 8-byte header followed by Length bytes of
 payload.</p>
@@ -83,8 +84,8 @@ MUST ignore them.</li>
 at 1. Each request MUST use a higher ID than the one before (gaps are
 allowed), and the response carries the same ID. Stream 0 stands for the
 connection itself: in v1 it carries only unknown frames and the
-connection-error message of §6. After using ID 16 777 215 the client
-MUST close the connection.</li>
+connection-error message of §6. A client never uses an ID above 16 777
+215; one with more requests stops and reports an error.</li>
 </ul>
 <h2 id="unknown-frame-types">3. Unknown frame types</h2>
 <p>A receiver that reads a frame of unknown type MUST skip it: read and
@@ -109,7 +110,7 @@ less; receivers MUST accept any Length. A body ends at END_STREAM. A
 response to HEAD is always a single HEADERS frame with END_STREAM. Any
 other response with <code>content-length</code> MUST carry exactly that
 many DATA bytes; a difference is a protocol error. A request&#39;s
-<code>content-length</code> must be well-formed (§5) but is otherwise
+<code>content-length</code> MUST be well-formed (§5) and is otherwise
 ignored. A sender that cannot finish a body MUST close the connection
 without END_STREAM, so the client can tell the body is incomplete.</p>
 <h2 id="header-block">5. Header block</h2>
@@ -181,21 +182,21 @@ defined in v1.</p>
 <ul>
 <li>Literal names are 1 to 32 767 lowercase HTTP token characters (RFC
 9110 §5.6.2), so pseudo-headers (names starting with <code>:</code>) can
-only be sent by tag. Senders MUST use the tag for any name in the table;
-receivers MUST also accept the other table names as literals.</li>
+only be sent by tag. Senders MUST use the tag for a table name;
+receivers MUST accept non-pseudo table names as literals too.</li>
 <li>Values are 0 to 32 767 bytes and may hold any byte except NUL, CR
 and LF. <code>content-length</code> is 1 to 18 ASCII digits.
 <code>date</code> SHOULD use the HTTP date format (RFC 9110 §5.6.7) and
-is not checked. Senders SHOULD use the one-byte <code>len</code> when it
-fits; receivers accept both forms.</li>
+is not checked. Senders SHOULD use the shortest <code>len</code>;
+receivers accept both.</li>
 <li>Pseudo-headers come before all other fields. <code>:method</code>,
 <code>:path</code>, <code>:status</code>, <code>host</code> and
 <code>content-length</code> appear at most once each, counted by name
 whether sent by tag or literal; other names may repeat.</li>
 <li>A request has one <code>:method</code>, a case-sensitive HTTP token,
 and one <code>:path</code>, starting with <code>/</code> and at most
-1024 bytes as sent. It has no <code>:status</code>, and SHOULD have
-<code>host</code>.</li>
+1024 bytes as sent. It has no <code>:status</code>; <code>host</code>
+SHOULD be sent.</li>
 <li>A response has one <code>:status</code>, three ASCII digits from 200
 to 599, and no <code>:method</code> or <code>:path</code>. v1 has no 1xx
 responses.</li>
@@ -204,47 +205,67 @@ length running past the payload is malformed.</li>
 </ul>
 <h2 id="server">6. Server</h2>
 <p>The server cuts <code>:path</code> at the first <code>?</code> or
-<code>#</code>, decodes <code>%XX</code> escapes (<code>%2F</code> is a
-slash, <code>%2e%2e</code> is <code>..</code>), refuses any
-<code>..</code> segment and resolves the rest under its root, following
-symbolic links. The resolved result must lie inside the root, have no
-component starting with a dot, and be a regular file; a directory or a
-trailing <code>/</code> means <code>index.html</code>. A found file gets
-<code>200</code> (with <code>content-type</code>,
-<code>content-length</code>, <code>server</code>, <code>date</code>) and
-the file as DATA; an error gets a short <code>text/plain</code> body;
-HEAD gets the same headers and no DATA. Checks run in table order,
-except that hidden paths always get 404.</p>
+<code>#</code> and decodes <code>%XX</code> escapes (<code>%2F</code> is
+a slash, <code>%2e%2e</code> is <code>..</code>). A directory, or a path
+ending in <code>/</code>, means its <code>index.html</code>. Every
+response carries <code>content-type</code>, <code>content-length</code>,
+<code>server</code> and <code>date</code>; a found file gets
+<code>200</code> and the file as DATA, an error a short
+<code>text/plain</code> body, and HEAD no DATA. The first matching row
+below decides. A segment is a piece of the decoded path between slashes;
+resolved means after following symbolic links.</p>
 <table>
 <colgroup>
-<col style="width: 6%" />
-<col style="width: 93%" />
+<col style="width: 4%" />
+<col style="width: 5%" />
+<col style="width: 89%" />
 </colgroup>
 <thead>
 <tr>
+<th>#</th>
 <th>status</th>
 <th>when</th>
 </tr>
 </thead>
 <tbody>
 <tr>
+<td>1</td>
 <td>400</td>
 <td>malformed header block (§5), block over 65 535 bytes, bad
 <code>%</code> escape (not two hex digits) or <code>%00</code></td>
 </tr>
 <tr>
+<td>2</td>
 <td>405</td>
 <td>a well-formed method other than GET or HEAD</td>
 </tr>
 <tr>
+<td>3</td>
 <td>403</td>
-<td>a <code>..</code> segment, a path resolving outside the root, or a
-file the server may not read</td>
+<td>a segment equal to <code>..</code></td>
 </tr>
 <tr>
+<td>4</td>
 <td>404</td>
-<td>a hidden (dot) path, or anything else that is not a regular file
-inside the root</td>
+<td>any other segment starting with a dot (<code>.</code>,
+<code>.env</code>)</td>
+</tr>
+<tr>
+<td>5</td>
+<td>403</td>
+<td>the resolved path lies outside the root, or the server may not read
+it</td>
+</tr>
+<tr>
+<td>6</td>
+<td>404</td>
+<td>the resolved path has a component starting with a dot, or is not a
+regular file</td>
+</tr>
+<tr>
+<td>7</td>
+<td>500</td>
+<td>the file cannot be opened or read for any other reason</td>
 </tr>
 </tbody>
 </table>
@@ -253,13 +274,11 @@ inside the root</td>
 open. Connection errors, where the frame sequence can no longer be
 trusted, are: HEADERS on stream 0 or with an ID not higher than the
 last; DATA with no request open or on a different stream; or a new
-HEADERS before the open request&#39;s END_STREAM. Requests completed before
-the bad frame are answered first. Then the server sends the
-connection-error message on stream 0 and closes: a HEADERS frame
-(<code>:status</code> 400, <code>content-type</code>,
-<code>content-length</code>) and then DATA holding the reason, the last
-frame with END_STREAM. If a frame is cut off by EOF, the server just
-closes.</p>
+HEADERS before the open request&#39;s END_STREAM. After answering requests
+completed before the bad frame, the server sends the connection-error
+message on stream 0 (HEADERS with <code>:status</code> 400, then DATA
+holding the reason, the last with END_STREAM) and closes. If a frame is
+cut off by EOF, the server just closes.</p>
 <h2 id="client">7. Client</h2>
 <p>The client matches responses to requests in order. A HEADERS frame on
 stream 0, at any point, starts a connection-error message; the client
@@ -274,37 +293,39 @@ and a read timeout.</p>
 <p>HTTP/2&#39;s header is Length 24, Type 8, Flags 8, then a reserved bit
 and a 31-bit Stream ID: 9 bytes. Its drafts used 8 bytes (a 16-bit
 Length in draft 04, 14 bits plus two reserved bits in draft 13) until
-draft 14 (2014) widened Length to 24 bits. Frames over 2^14 bytes need
-the receiver&#39;s SETTINGS_MAX_FRAME_SIZE, so one large frame cannot delay
-the others. Both ends start streams (client odd, server even), giving
-the client 2^30 IDs and the server 2^30 − 1. The top bit is reserved
-with no meaning (RFC 9113 §4.1); in SPDY, HTTP/2&#39;s predecessor, the
-first bit of a frame marked control frames.</p>
-<p>BHTTP/1 uses 24 / 8 / 8 / 24 (8 bytes):</p>
+draft 14 (2014) widened Length to 24 bits so a receiver can opt in to
+larger frames for bulk transfer; the default stays 2^14 so one big frame
+cannot delay the others. Flags are defined per frame type, so 8 bits are
+enough. The 31-bit Stream ID is a 32-bit word minus a reserved bit with
+no meaning (RFC 9113 §4.1); both ends start streams (client odd, server
+even), giving the client 2^30 IDs and the server 2^30 − 1. BHTTP/1 uses
+24 / 8 / 8 / 24 (8 bytes):</p>
 <ul>
-<li>Length 24. v1&#39;s recommended sizes (16 KiB DATA, 64 KiB − 1 header
-blocks) fit in 16 bits; the extra byte allows larger frames now and in
-v2. The width cannot change later without breaking §3, because skipping
-depends on every version reading Length the same way.</li>
-<li>Type 8 and Flags 8. Whole bytes keep the header simple to read. v1
+<li>Length 24. v1&#39;s sizes (16 KiB DATA recommended, header blocks at
+most 64 KiB − 1) fit in 16 bits; the extra byte allows larger frames now
+and in v2. Its width can never change, since §3&#39;s skipping relies on
+every version reading Length alike.</li>
+<li>Type 8 and Flags 8. Whole bytes need no bit masking, and with Length
+they fill the first 32-bit word exactly, the Stream ID the second. v1
 uses two types and one flag. A v2 can add frame types freely (§3), but a
 v1 peer would ignore a new flag and reject a new tag, so those need
 agreement first (below).</li>
 <li>Stream ID 24. v1 answers strictly in order and has no server-started
 streams, so it needs no odd/even split or reserved bit. The ID still
 matches each response to its request, exposes stale or misplaced frames,
-and leaves room for v2 multiplexing. At 1000 requests a second, 2^24 IDs
-last 4.7 hours.</li>
+and leaves room for v2 multiplexing. At the 19 000 requests a second
+bserve manages on loopback, 2^24 IDs last 15 minutes of continuous
+use.</li>
 </ul>
-<p>From HPACK (61 static name–value pairs, a dynamic table, Huffman
-coding, prefix-coded integers) BHTTP/1 takes two ideas: names from a
-fixed table (HPACK&#39;s &quot;literal with indexed name&quot;) and length-prefixed
-literals. It indexes names only, since most values here (paths, dates,
-lengths) change on every message.</p>
+<p>From HPACK (static and dynamic tables, Huffman coding, prefix-coded
+integers) BHTTP/1 takes two ideas: names from a fixed table (HPACK&#39;s
+&quot;literal with indexed name&quot;) and length-prefixed literals. It indexes
+names only, since most values here (paths, dates, lengths) change on
+every message.</p>
 <p>With no preface, a misdirected HTTP/1.1 <code>GET /</code> reads as
-an unknown frame of Length 0x474554, skipped until the idle limit: a
-slow failure v1 accepts. To grow, a v2 client first sends a new frame
-type (say SETTINGS) that a v2 server acknowledges before its first
-response and a v1 server skips.</p>
+an unknown frame of Length 0x474554 and is skipped until the idle limit;
+v1 accepts that rather than add a preface to every connection. To grow,
+a v2 client first sends a new frame type, which a v2 server acknowledges
+before its first response and a v1 server skips.</p>
 </body>
 </html>

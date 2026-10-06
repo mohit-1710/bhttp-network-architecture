@@ -177,7 +177,7 @@ def test_server():
         s.sendall(frame(0xFA, 0, 4, b"from the future"))
         request(s, 4, "/about.html")
         st, _, _ = recv_response(s, 4)
-        check("unknown frame types are skipped cleanly", st == 200)
+        check("unknown frames on stream 0 and on the request stream are skipped", st == 200)
 
         # Unknown flag bits are ignored.
         s.sendall(frame(HEADERS, END_STREAM | 0xF0, 5,
@@ -454,6 +454,16 @@ def test_root_and_timeouts():
             check("slow reader is dropped once a frame waits longer than -t", aborted)
             s.close()
             s = connect(port)
+
+            # A bad frame plus one stray byte, then silence: the server must
+            # still close soon after reporting the connection error.
+            s = connect(port)
+            s.sendall(frame(DATA, 0, 1, b"") + b"\x00")
+            st, _, _ = recv_response(s, 0)
+            t0 = time.monotonic()
+            check("after a connection error the server closes even if the client goes quiet",
+                  st == 400 and closed_by_peer(s, wait=6) and time.monotonic() - t0 < 4)
+            s.close()
 
             # Idle connection is closed after the timeout (2 s here).
             s = connect(port)
