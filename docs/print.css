@@ -1,11 +1,13 @@
-@page { size: A4; margin: 13mm 14mm; }
-body { font: 9.4pt/1.36 -apple-system, "Helvetica Neue", Arial, sans-serif; color: #111; max-width: none; margin: 0; }
-header#title-block-header { margin-bottom: 4px; border-bottom: 2px solid #111; padding-bottom: 4px; }
-h1.title { font-size: 17pt; margin: 0; } p.subtitle { margin: 0; color: #555; font-size: 9.5pt; }
-h2 { font-size: 10.5pt; margin: 9px 0 3px; border-bottom: 1px solid #ccc; }
-p, ul { margin: 3px 0; } li { margin: 1px 0; } ul { padding-left: 16px; }
-pre { font: 8.2pt/1.25 Menlo, monospace; background: #f5f5f5; padding: 5px 7px; margin: 4px 0; border-radius: 3px; }
-code { font: 8.4pt Menlo, monospace; }
-table { border-collapse: collapse; margin: 4px 0; font-size: 8.8pt; }
+@page { size: A4; margin: 12mm 13mm; }
+body { font: 9.3pt/1.34 -apple-system, "Helvetica Neue", Arial, sans-serif; color: #111; max-width: none; margin: 0; padding: 0; }
+header#title-block-header { margin-bottom: 4px; border-bottom: 1.5px solid #111; padding-bottom: 3px; }
+h1.title { font-size: 15pt; margin: 0; } p.subtitle { margin: 0; color: #555; font-size: 9pt; }
+h2 { font-size: 10.3pt; margin: 8px 0 2px; border-bottom: 1px solid #ccc; break-after: avoid; page-break-after: avoid; }
+p, ul { margin: 3px 0; } li { margin: 1px 0; } ul { padding-left: 15px; }
+pre { font: 8pt/1.22 Menlo, monospace; background: #f4f4f4; padding: 4px 7px; margin: 3px 0; border-radius: 3px; break-inside: avoid; }
+code { font: 8.3pt Menlo, monospace; }
+table { border-collapse: collapse; margin: 3px 0; font-size: 8.7pt; break-inside: avoid; }
 td, th { border: 1px solid #ccc; padding: 1px 6px; text-align: left; vertical-align: top; }
+td:first-child, th:first-child { white-space: nowrap; }
 th { background: #eee; }
+table code { white-space: nowrap; }

@@ -1,19 +1,20 @@
 /*
  * bcurl - BHTTP/1 client (Track 2).
  *
- *   usage: bcurl [-v] [-I] [-X METHOD] [-H 'name: value']... [--grease]
+ *   usage: bcurl [-v] [-I] [-X METHOD] [-H 'name: value']... [-t seconds] [--grease]
  *                [bhttp://]host[:port][/path] [/more/paths ...]
  *
  * Builds binary request frames, writes response bodies to stdout, and with -v
  * hexdumps every frame (sent '>' and received '<') to stderr. Extra paths are
- * fetched over the SAME connection - bcurl never opens a second one.
+ * fetched one after another over the same connection.
  *
  * Exit status: 0 all responses 1xx-3xx, 1 usage, 2 cannot connect,
- *              3 protocol error, 4 a 4xx response, 5 a 5xx response.
+ *              3 protocol, timeout or output error, 4 a 4xx, 5 a 5xx response.
  */
 #include "bproto.h"
 
 #include <ctype.h>
+#include <fcntl.h>
 #include <netdb.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
@@ -22,21 +23,22 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <unistd.h>
 
 #define DEFAULT_PORT "9000"
 #define USER_AGENT   "bcurl/1.0"
 #define MAX_EXTRA    32
-#define GREASE_TYPE  0xFA   /* deliberately unassigned frame type */
 
 enum { EX_OK = 0, EX_USAGE = 1, EX_CONNECT = 2, EX_PROTO = 3, EX_4XX = 4, EX_5XX = 5 };
 
 static FILE *g_trace;
+static int   g_timeout = 30;        /* -t: s without any bytes from the server */
 
 static void usage(void)
 {
     fprintf(stderr,
-            "usage: bcurl [-v] [-I] [-X METHOD] [-H 'name: value']... [--grease]\n"
+            "usage: bcurl [-v] [-I] [-X METHOD] [-H 'name: value']... [-t seconds] [--grease]\n"
             "             [bhttp://]host[:port][/path] [/more/paths ...]\n");
     exit(EX_USAGE);
 }
@@ -46,8 +48,12 @@ typedef struct { char host[256]; char port[8]; char path[4096]; } target;
 /* Parse [bhttp://]host[:port][/path], with [v6]:port allowed. */
 static int parse_url(const char *url, target *t)
 {
-    if (strncmp(url, "bhttp://", 8) == 0)
+    const char *scheme = strstr(url, "://");
+    if (scheme) {
+        if (strncmp(url, "bhttp://", 8) != 0)
+            return -1;              /* http://, https:// ... are not BHTTP */
         url += 8;
+    }
     const char *slash = strchr(url, '/');
     size_t alen = slash ? (size_t)(slash - url) : strlen(url);
     char auth[300];
@@ -73,7 +79,9 @@ static int parse_url(const char *url, target *t)
     if (!*host || strlen(host) >= sizeof t->host)
         return -1;
     strcpy(t->host, host);
-    if (port && *port) {
+    if (port && !*port)
+        return -1;                  /* "host:" with no port */
+    if (port) {
         char *end;
         long p = strtol(port, &end, 10);
         if (*end || p < 1 || p > 65535)
@@ -83,7 +91,7 @@ static int parse_url(const char *url, target *t)
         strcpy(t->port, DEFAULT_PORT);
     }
     const char *path = slash ? slash : "/";
-    if (strlen(path) >= sizeof t->path)
+    if (strlen(path) > BH_MAX_PATH)
         return -1;
     strcpy(t->path, path);
     return 0;
@@ -116,22 +124,76 @@ static int connect_to(const target *t)
         return -1;
     }
     int one = 1;
+    struct timeval tv = { g_timeout, 0 };
     setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
     return fd;
 }
 
 typedef struct {
     const char *method;
-    const char *extra[MAX_EXTRA];   /* "name: value" */
+    char *names[MAX_EXTRA];         /* from -H, lowercased and validated */
+    const char *values[MAX_EXTRA];
     int nextra;
     int grease;
 } options;
+
+/* Split and check a -H 'name: value' argument against SPEC §5. */
+static void add_header(options *o, const char *arg)
+{
+    const char *colon = strchr(arg, ':');
+    if (o->nextra == MAX_EXTRA) {
+        fprintf(stderr, "bcurl: at most %d -H options\n", MAX_EXTRA);
+        exit(EX_USAGE);
+    }
+    size_t nl = colon ? (size_t)(colon - arg) : 0;
+    char *name = malloc(nl + 1);
+    if (!name)
+        exit(EX_USAGE);
+    for (size_t k = 0; k < nl; k++)
+        name[k] = (char)tolower((unsigned char)arg[k]);
+    name[nl] = '\0';
+    const char *val = colon ? colon + 1 : "";
+    while (*val == ' ')
+        val++;
+    if (!colon || !bh_valid_name(name) || !bh_valid_value(val)) {
+        fprintf(stderr, "bcurl: bad header '%s' (want 'name: value', name in visible "
+                        "ASCII without ':' or spaces, value under 32768 bytes)\n", arg);
+        exit(EX_USAGE);
+    }
+    o->names[o->nextra] = name;
+    o->values[o->nextra++] = val;
+}
+
+static int three_digits(const char *s)
+{
+    return s && s[0] >= '1' && s[0] <= '5' && s[1] >= '0' && s[1] <= '9' &&
+           s[2] >= '0' && s[2] <= '9' && s[3] == '\0';
+}
+
+/* The server reported a connection error on stream 0: show it and give up. */
+static void report_connection_error(int fd, const bh_frame *f)
+{
+    int end = f->flags & BH_FLAG_END_STREAM;
+    bh_frame d;
+    fprintf(stderr, "bcurl: server reported a connection error");
+    while (!end && bh_next_frame(fd, &d, g_trace) == 0 && d.type == BH_DATA && d.stream == 0 &&
+           d.length <= 4096) {
+        char msg[4097], safe[4 * 4096 + 8];
+        if (bh_read_full(fd, msg, d.length) != 0)
+            break;
+        msg[d.length] = '\0';
+        fprintf(stderr, ": %s", bh_escape(msg, safe, sizeof safe));
+        end = d.flags & BH_FLAG_END_STREAM;
+    }
+    fputc('\n', stderr);
+}
 
 static int send_request(int fd, uint32_t sid, const target *t, const options *o)
 {
     if (o->grease) {
         static const char junk[] = "unknown frame, please skip me";
-        if (bh_send_frame(fd, GREASE_TYPE, 0, 0, junk, sizeof junk - 1, g_trace) != 0)
+        if (bh_send_frame(fd, BH_GREASE_TYPE, 0, 0, junk, sizeof junk - 1, g_trace) != 0)
             return -1;
     }
     char authority[300];
@@ -146,23 +208,8 @@ static int send_request(int fd, uint32_t sid, const target *t, const options *o)
     bh_hb_add(&b, "host", authority);
     bh_hb_add(&b, "user-agent", USER_AGENT);
     bh_hb_add(&b, "accept", "*/*");
-    for (int i = 0; i < o->nextra; i++) {
-        char name[256];
-        const char *colon = strchr(o->extra[i], ':');
-        size_t nl = colon ? (size_t)(colon - o->extra[i]) : 0;
-        if (!colon || nl == 0 || nl >= sizeof name) {
-            fprintf(stderr, "bcurl: bad header '%s'\n", o->extra[i]);
-            bh_buf_free(&b);
-            exit(EX_USAGE);
-        }
-        for (size_t k = 0; k < nl; k++)
-            name[k] = (char)tolower((unsigned char)o->extra[i][k]);
-        name[nl] = '\0';
-        const char *val = colon + 1;
-        while (*val == ' ')
-            val++;
-        bh_hb_add(&b, name, val);
-    }
+    for (int i = 0; i < o->nextra; i++)
+        bh_hb_add(&b, o->names[i], o->values[i]);
     int rc = b.err ? -1
                    : bh_send_frame(fd, BH_HEADERS, BH_FLAG_END_STREAM, sid, b.buf,
                                    (uint32_t)b.len, g_trace);
@@ -176,7 +223,12 @@ static int read_response(int fd, uint32_t sid)
     bh_frame f;
     int r = bh_next_frame(fd, &f, g_trace);
     if (r != 0) {
-        fprintf(stderr, "bcurl: connection closed before a response arrived\n");
+        fprintf(stderr, "bcurl: connection closed or timed out before a response arrived\n");
+        return -1;
+    }
+    if (f.type == BH_HEADERS && f.stream == 0 && f.length <= BH_MAX_HEADER_BLOCK) {
+        if (bh_read_payload(fd, &f, NULL, NULL) == 0)
+            report_connection_error(fd, &f);
         return -1;
     }
     if (f.type != BH_HEADERS || f.stream != sid) {
@@ -201,15 +253,14 @@ static int read_response(int fd, uint32_t sid)
     int status = -1;
     if (bh_hb_decode(block, f.length, &h) == 0) {
         const char *s = bh_get(&h, ":status");
-        char *end;
-        long v = s ? strtol(s, &end, 10) : -1;
-        if (s && !*end && v >= 100 && v <= 599 && bh_count(&h, ":status") == 1)
-            status = (int)v;
+        if (three_digits(s) && bh_count(&h, ":status") == 1 && bh_count(&h, ":method") == 0 &&
+            bh_count(&h, ":path") == 0)
+            status = atoi(s);
         bh_headers_free(&h);
     }
     free(block);
     if (status < 0) {
-        fprintf(stderr, "bcurl: response has a malformed header block or no :status\n");
+        fprintf(stderr, "bcurl: response has a malformed header block or no valid :status\n");
         return -1;
     }
 
@@ -231,25 +282,33 @@ static int read_response(int fd, uint32_t sid)
             if (n > sizeof chunk)
                 n = sizeof chunk;
             if (bh_read_full(fd, chunk, n) != 0) {
-                fprintf(stderr, "bcurl: truncated DATA frame\n");
+                fprintf(stderr, "bcurl: truncated DATA frame or read timeout\n");
                 return -1;
             }
             if (g_trace)
                 bh_hexdump(g_trace, '<', chunk, n, done);
-            fwrite(chunk, 1, n, stdout);
+            if (fwrite(chunk, 1, n, stdout) != n) {
+                fprintf(stderr, "bcurl: writing to stdout failed\n");
+                return -1;
+            }
             done += n;
         }
         end = f.flags & BH_FLAG_END_STREAM;
     }
-    fflush(stdout);
+    if (fflush(stdout) != 0) {
+        fprintf(stderr, "bcurl: writing to stdout failed\n");
+        return -1;
+    }
     return status;
 }
 
 int main(int argc, char **argv)
 {
     options o = { .method = "GET" };
-    const char *urls[256];
+    const char **urls = calloc((size_t)argc, sizeof *urls);
     int nurls = 0;
+    if (!urls)
+        return EX_USAGE;
 
     for (int i = 1; i < argc; i++) {
         const char *a = argv[i];
@@ -259,13 +318,15 @@ int main(int argc, char **argv)
             o.method = "HEAD";
         else if (strcmp(a, "-X") == 0 && i + 1 < argc)
             o.method = argv[++i];
-        else if (strcmp(a, "-H") == 0 && i + 1 < argc && o.nextra < MAX_EXTRA)
-            o.extra[o.nextra++] = argv[++i];
+        else if (strcmp(a, "-H") == 0 && i + 1 < argc)
+            add_header(&o, argv[++i]);
+        else if (strcmp(a, "-t") == 0 && i + 1 < argc && (g_timeout = atoi(argv[i + 1])) > 0)
+            i++;
         else if (strcmp(a, "--grease") == 0)
             o.grease = 1;
         else if (a[0] == '-')
             usage();
-        else if (nurls < (int)(sizeof urls / sizeof urls[0]))
+        else
             urls[nurls++] = a;
     }
     if (nurls == 0)
@@ -277,13 +338,21 @@ int main(int argc, char **argv)
         return EX_USAGE;
     }
     /* Every later argument must address the same server: one connection only. */
-    target ts[256];
+    if ((uint32_t)nurls > BH_MAX_STREAM) {
+        fprintf(stderr, "bcurl: too many requests for one connection\n");
+        return EX_USAGE;
+    }
+    target *ts = calloc((size_t)nurls, sizeof *ts);
+    if (!ts)
+        return EX_USAGE;
     ts[0] = base;
     for (int i = 1; i < nurls; i++) {
         ts[i] = base;
         if (urls[i][0] == '/') {
-            if (strlen(urls[i]) >= sizeof ts[i].path)
+            if (strlen(urls[i]) > BH_MAX_PATH) {
+                fprintf(stderr, "bcurl: path longer than %u bytes\n", BH_MAX_PATH);
                 return EX_USAGE;
+            }
             strcpy(ts[i].path, urls[i]);
         } else if (parse_url(urls[i], &ts[i]) != 0 || strcmp(ts[i].host, base.host) != 0 ||
                    strcmp(ts[i].port, base.port) != 0) {
@@ -293,6 +362,12 @@ int main(int argc, char **argv)
         }
     }
 
+    /* With fd 1 closed, socket() would hand out fd 1 and the body would be
+     * written back into the connection. */
+    if (fcntl(STDOUT_FILENO, F_GETFD) < 0) {
+        fprintf(stderr, "bcurl: stdout is closed\n");
+        return EX_PROTO;
+    }
     signal(SIGPIPE, SIG_IGN);
     int fd = connect_to(&base);
     if (fd < 0)

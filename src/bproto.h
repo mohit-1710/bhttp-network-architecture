@@ -22,10 +22,12 @@
 #define BH_MAX_HEADER_BLOCK 65536u      /* receivers MUST accept at least this */
 #define BH_DATA_CHUNK       16384u      /* senders SHOULD NOT exceed this per DATA frame */
 #define BH_MAX_STRING       0x7FFFu     /* longest string a 2-byte length prefix holds */
-#define BH_MAX_FIELDS       64
+#define BH_MAX_PATH         1024u       /* longest :path a server must handle */
 
-/* Frame types. Anything else is unknown and MUST be skipped. */
+/* Frame types. Anything else is unknown and MUST be skipped.
+ * 0xF0-0xFF are never assigned; bcurl --grease sends one to test peers. */
 enum { BH_DATA = 0x00, BH_HEADERS = 0x01 };
+#define BH_GREASE_TYPE 0xFA
 
 /* Flags. Unknown flag bits MUST be ignored by receivers. */
 #define BH_FLAG_END_STREAM 0x01
@@ -40,7 +42,10 @@ typedef struct {
 void bh_pack_header(uint8_t out[BH_FRAME_HEADER_LEN], const bh_frame *f);
 void bh_unpack_header(const uint8_t in[BH_FRAME_HEADER_LEN], bh_frame *f);
 
-/* Blocking I/O. read_full: 0 ok, 1 clean EOF before any byte, -1 error/short read. */
+/* Blocking I/O. read_full: 0 ok, 1 clean EOF before any byte, -1 error/short read.
+ * Reads fail with ETIMEDOUT once the deadline set by bh_set_deadline passes
+ * (seconds from now; 0 = no deadline). Writes are not affected. */
+void bh_set_deadline(int seconds);
 int bh_read_full(int fd, void *buf, size_t n);
 int bh_write_full(int fd, const void *buf, size_t n);
 
@@ -66,9 +71,12 @@ void bh_hb_add(bh_buf *b, const char *name, const char *value);
 void bh_buf_free(bh_buf *b);
 
 typedef struct { const char *name; const char *value; int index; } bh_field;
-typedef struct { bh_field f[BH_MAX_FIELDS]; int n; char *arena; } bh_headers;
+typedef struct { bh_field *f; int n; char *arena; } bh_headers;
 
-int  bh_hb_decode(const uint8_t *p, size_t len, bh_headers *h); /* 0 ok, -1 malformed */
+/* 0 ok, -1 malformed. Enforces SPEC §5: names, values, pseudo-headers first. */
+int  bh_hb_decode(const uint8_t *p, size_t len, bh_headers *h);
+int  bh_valid_name(const char *name);     /* literal name a sender may use */
+int  bh_valid_value(const char *value);
 const char *bh_get(const bh_headers *h, const char *name);
 int  bh_count(const bh_headers *h, const char *name);
 void bh_headers_free(bh_headers *h);
@@ -77,5 +85,8 @@ void bh_headers_free(bh_headers *h);
 void bh_trace_header(FILE *o, char dir, const bh_frame *f);
 void bh_hexdump(FILE *o, char dir, const uint8_t *p, size_t n, size_t base);
 void bh_trace_fields(FILE *o, char dir, const uint8_t *p, size_t len);
+
+/* Copy s into out with non-printable bytes shown as \xHH (safe for terminals). */
+const char *bh_escape(const char *s, char *out, size_t n);
 
 #endif

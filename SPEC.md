@@ -1,15 +1,17 @@
 ---
-title: "BHTTP/1 — HTTP, in binary"
-subtitle: "Protocol specification · version 1"
+title: "BHTTP/1: a binary framing for HTTP"
+subtitle: "Specification, version 1"
 ---
 
-The key words MUST, MUST NOT, SHOULD and MAY are used as in RFC 2119. All integers are unsigned and big-endian (network byte order).
+MUST, MUST NOT, SHOULD and MAY are used as in RFC 2119. Integers are unsigned and big-endian. Sizes are in bytes.
 
-## 1. Model
+## 1. Connection
 
-BHTTP/1 carries HTTP request/response semantics over one TCP connection (default port **9000**) as a sequence of binary **frames**. There is no connection preface. The client sends a request, reads the complete response, and MAY then send another request **on the same connection**. A client MUST NOT open a second connection to make further requests to the same server. The server keeps the connection open until the client closes it (or after 30 s idle, which is implementation-defined).
+BHTTP/1 runs over one TCP connection (default port 9000) with no preface. The client sends its requests one after another and the server answers each, in order, on the same connection, which stays open until the client closes it. A client MUST NOT open a second connection during one run (one set of requests). If the server closes the connection, the client reports the remaining requests as failed rather than reconnecting. A client SHOULD wait for the end of a response before sending the next request. A server MUST still accept requests sent earlier (pipelining) and answer them in order. A server MAY close a connection that is idle, or that takes too long to deliver a request; bserve allows 30 s for each.
 
-## 2. Frame header (8 bytes, fixed)
+## 2. Frame header
+
+Every frame is an 8-byte header followed by Length bytes of payload.
 
 ```
  0                   1                   2                   3
@@ -19,70 +21,73 @@ BHTTP/1 carries HTTP request/response semantics over one TCP connection (default
 +---------------+-----------------------------------------------+
 |   Flags (8)   |               Stream ID (24)                  |
 +---------------+-----------------------------------------------+
-|                    Payload (Length bytes) ...                 |
 ```
 
-* **Length**: payload size in bytes, excluding these 8 header bytes (0 … 16 777 215).
-* **Type**: `0x00` DATA, `0x01` HEADERS. Every other value is **unknown** (see §3).
-* **Flags**: `0x01` END_STREAM, set on the last frame of a request or response. Senders MUST set every other bit to 0; receivers MUST ignore bits they do not know.
-* **Stream ID**: ties a response to its request. Requests use 1, 2, 3, … (strictly increasing). 0 is reserved for connection-level frames.
+* Length: payload size, not counting the header (0 to 16 777 215).
+* Type: `0x00` DATA, `0x01` HEADERS. Any other value is an unknown type (§3).
+* Flags: `0x01` END_STREAM marks the last frame of a request or response. Senders set the other bits to 0 and receivers ignore them.
+* Stream ID: the client numbers its requests on a connection, starting at 1. Each request MUST use a higher ID than the one before (gaps are allowed), and the response carries the same ID. Stream 0 stands for the connection itself: in v1 it carries only unknown frames and the connection-error response of §6. After using ID 16 777 215 the client MUST close the connection.
 
-## 3. Unknown frames (the rule that leaves room for version 2)
+## 3. Unknown frame types
 
-**A receiver that reads a frame whose Type it does not know MUST skip it cleanly.** It reads and discards exactly Length payload bytes and then carries on with the next frame. It MUST NOT answer with an error, close the connection, or change any request state. The rule applies on every stream, stream 0 included, and also between the frames of a request or response. Because every frame states its own length, a v1 peer can always resynchronise past features it has never heard of.
+A receiver that reads a frame of unknown type MUST skip it: read and discard exactly Length payload bytes, then go on to the next frame. It MUST NOT reply to it, close the connection over it, or let it change any request state, whatever its stream ID or flags (END_STREAM on an unknown frame ends nothing). This holds everywhere in the frame sequence, including between the frames of one request or response. Types `0xF0`–`0xFF` will never be assigned. Senders may use them to check that peers skip properly (`bcurl --grease` sends `0xFA`). Skipping works in small chunks, so it costs time, not memory, and §1's timeouts bound the time. HTTP/2 has the same rule (RFC 9113 §4.1, §5.5).
 
 ## 4. Messages
 
-A **request** is one HEADERS frame followed by zero or more DATA frames. A **response** is the same thing, on the same Stream ID. END_STREAM marks the last frame. A message with no body is a single HEADERS frame with END_STREAM set. The whole header block MUST fit in one HEADERS frame, and receivers MUST accept header blocks up to 65 536 bytes. DATA payloads are opaque bytes. Senders SHOULD keep each DATA frame at 16 384 bytes or fewer, and receivers MUST accept any length. END_STREAM, not `content-length`, decides where a body ends.
+A request is one HEADERS frame and then zero or more DATA frames on the same stream, with END_STREAM on the last frame. A response has the same shape. A message with no body is a single HEADERS frame with END_STREAM set. The header block MUST fit in one HEADERS frame. Receivers MUST accept blocks of up to 65 536 bytes holding any number of fields. Senders SHOULD keep DATA frames to 16 384 bytes or less; receivers MUST accept any Length. A body ends at END_STREAM. `content-length` is for information only and receivers do not check it: a response to HEAD carries the file's length but no DATA.
 
-## 5. Header block encoding
+## 5. Header block
 
-The payload of a HEADERS frame is a list of fields with no count and no terminator; the frame Length bounds it.
+A HEADERS payload is a sequence of fields, with no count and no terminator; the frame's Length bounds it. In the grammar, `tag` is one byte and `len` is one or two bytes.
 
 ```
-field  = tag:1  [ string ]   string        ; name string present only when tag = 0
-string = len  bytes
-len    = 0xxxxxxx                          ; 0 … 127, one byte
-       | 1xxxxxxx xxxxxxxx                 ; 0 … 32 767, two bytes (15 bits)
+field  = tag [name] value        ; name present only when tag = 0
+name   = len bytes               value = len bytes
+len    = 0xxxxxxx                ; 0 to 127
+       | 1xxxxxxx xxxxxxxx       ; 0 to 32 767 (15 bits, big-endian)
 ```
 
-**tag = 0** means a literal name follows. **tag 1–10** names a field from the static table below. These are the ten names BHTTP/1 actually sends. Tags 11–255 are reserved; a v1 receiver treats them as malformed.
+Tag 0 means the name follows as a literal. Tags 1 to 10 select a name from the table below, which lists every name bserve and bcurl send. Tags 11 to 255 are not defined in v1.
 
-| # | name | # | name | # | name | # | name | # | name |
-|---|------|---|------|---|------|---|------|---|------|
+| tag | name | tag | name | tag | name | tag | name | tag | name |
+|---|---|---|---|---|---|---|---|---|---|
 | 1 | `:method` | 3 | `:status` | 5 | `user-agent` | 7 | `server` | 9 | `content-type` |
 | 2 | `:path` | 4 | `host` | 6 | `accept` | 8 | `date` | 10 | `content-length` |
 
-Names are lowercase visible ASCII (0x21–0x7E). Pseudo-header names begin with `:`, MUST be sent through the table and MUST NOT appear as literals. Values MUST NOT contain NUL, CR or LF. A request carries exactly one `:method` and one `:path`, and the `:path` begins with `/`. A response carries exactly one `:status` as three ASCII digits.
+* Names are 1 to 32 767 bytes of visible ASCII (`0x21`–`0x7E`) with no capital letters. A name starting with `:` is a pseudo-header and may only be sent through its tag. Senders use the tag for any name in the table. Receivers also accept the other table names as literals.
+* Values are 0 to 32 767 bytes and may hold any byte except NUL, CR and LF. Senders SHOULD use the one-byte `len` when it fits; receivers accept both forms.
+* Pseudo-headers come before all other fields. Other names may repeat.
+* A request has exactly one `:method` and one `:path`, and no `:status`. The path starts with `/` and is at most 1024 bytes. `host` SHOULD be sent.
+* A response has exactly one `:status`, three ASCII digits from 100 to 599, and no `:method` or `:path`. Every v1 response is final; there are no interim (1xx) responses before it.
+* A block that breaks any of these rules, or uses tags 11 to 255, is malformed.
 
-## 6. Server behaviour
+## 6. Server
 
-The server percent-decodes `:path`, drops any `?query`/`#fragment` and maps the result under its document root. A path ending in `/`, or naming a directory, maps to `index.html`. It answers `200` with the file as DATA frames, plus `content-type`, `content-length`, `server` and `date`. `HEAD` gets the same headers with no body. Errors carry a short `text/plain` body.
+To find the file, the server cuts `:path` at the first `?` or `#`, decodes `%XX` escapes, and refuses any `..` segment. It then resolves the result under its document root, following symbolic links, and checks that it still lies inside the root. A path that ends in `/`, or that names a directory, means that directory's `index.html`. A found file gets `200` with `content-type`, `content-length`, `server` and `date`, then the file as DATA. A HEAD request gets the same headers and no DATA. Errors get a short `text/plain` body.
 
 | status | when |
-|---|---|
-| 400 | malformed request: bad header block, reserved tag, missing or duplicate pseudo-headers, header block over 64 KiB |
-| 403 | path contains a `..` segment, or resolves (via symlinks) outside the root |
+|----|------------------------------------------------------------|
+| 400 | malformed header block (§5), header block over 65 536 bytes, bad `%` escape or `%00` in the path |
+| 403 | `..` segment, path resolving outside the root, or a file the server may not read |
 | 404 | no regular file at that path |
-| 405 | method other than GET / HEAD |
+| 405 | a method other than GET or HEAD |
 
-**Stream errors** (everything above) get a response, and **the connection stays open**. **Connection errors** are cases where the frame sequence itself can no longer be trusted: a HEADERS frame whose Stream ID is 0 or not greater than the previous one, DATA outside an open request, or a frame cut short by EOF. For these the server answers `400` on that Stream ID if it still can, and then closes the connection. A request body, if one is sent, is read and discarded.
+These are stream errors: the response goes on the request's stream and the connection stays open. Any request body is read and discarded first. A connection error means the frame sequence cannot be trusted any more. The cases are: HEADERS on stream 0 or with an ID not higher than the last; DATA with no request open or on a different stream; and a new HEADERS before the open request's END_STREAM. The server sends a `400` response on stream 0 with the reason in its body, then closes. If a frame is cut off by EOF the peer has gone, so the server just closes.
 
-## 7. Client behaviour (`bcurl`)
+## 7. Client
 
-The client sends one request at a time and reads the full response before sending the next. It writes response bodies to stdout. With `-v` it hexdumps every frame it sends (`>`) and receives (`<`) to stderr. Exit status: **0** if every response was 1xx–3xx, **4** if any was 4xx, **5** if any was 5xx, **3** on a protocol error, **2** if it could not connect, **1** on bad usage.
+The client treats the following as protocol errors, closes the connection and exits with 3: a response on a stream other than the current request's, DATA before HEADERS, a second HEADERS in one response, a malformed response header block, a frame cut off by EOF, or 30 s with no data. A `400` on stream 0 is a connection error report, which bcurl prints to stderr before exiting 3. bcurl writes bodies to stdout. With `-v` it hexdumps every frame it sends (`>`) and receives (`<`) to stderr, unknown ones included. Exit codes: 0 if every status was below 400, 4 if any was 4xx, 5 if any was 5xx, 3 for a protocol, timeout or output error, 2 if it cannot connect, 1 for bad arguments.
 
-## 8. Why these widths (and why HTTP/2 chose 24 / 8 / 8 / 31)
+## 8. Design notes
 
-HTTP/2 multiplexes many concurrent streams, so it needs a large stream space. Client and server both open streams, split between odd and even IDs, which costs a bit. The top bit is reserved so the ID still fits a signed 32-bit integer, as in Java. That gives 31 bits. Its 24-bit length allows frames up to 16 MiB but defaults to 16 KiB, and the header stays at 9 bytes. One type byte and one flags byte cover all of its frame types and their per-frame booleans.
+HTTP/2's header is Length 24, Type 8, Flags 8, then a reserved bit and a 31-bit Stream ID: 9 bytes. Its Length allows frames up to 16 MiB, but the default maximum is 16 KiB so that, with many streams sharing one connection, a single large frame cannot hold up the others for long. Peers that want bigger frames raise the limit with SETTINGS. A type byte and a flags byte cover its ten frame types and their options, with room to spare. Many streams are open at once and both ends can start them, so the ID space is large. Client streams are odd and server streams are even, which splits the values rather than costing a bit. The top bit is simply reserved with no meaning (RFC 9113 §4.1); it is usually traced back to SPDY, where the first bit of a frame marked control frames.
 
-**BHTTP/1 keeps 24 / 8 / 8 and shrinks the Stream ID to 24 bits**, which makes the header exactly **8 bytes**: one aligned 64-bit word.
+BHTTP/1 uses 24 / 8 / 8 / 24, which makes 8 bytes.
 
-* **Length 24**: a 16-bit length would cap frames at 64 KiB. 24 bits costs one byte and matches HTTP/2. Receivers stream DATA instead of buffering whole frames, so a large Length costs no memory, and header blocks have their own 64 KiB cap.
-* **Type 8**: v1 uses 2 of 256 values. Together with §3 that leaves 254 types for later versions.
-* **Flags 8**: v1 uses 1 bit. The other 7 are free for later versions, and receivers ignore them for now.
-* **Stream 24**: v1 does not multiplex, so the ID only correlates a response with its request. That allows 16.7 M requests per connection, more than any keep-alive will use. Because the field already exists, a v2 can add pipelining or multiplexing without changing the header.
+* Length 24. v1's own limits (16 KiB DATA, 64 KiB header blocks) almost fit 16 bits. The extra byte is headroom for a v2 that wants larger frames. The width cannot be changed later without breaking §3, because skipping depends on every version reading Length the same way.
+* Type 8 and Flags 8. v1 uses two types and one flag. The rest is space a v2 can use, and §3 makes using it safe.
+* Stream ID 24. v1 has one request in progress at a time and no server-initiated streams, so it needs no odd/even split and no reserved bit. The ID still matches each response to its request and lets a receiver notice a stale or misplaced frame. 16.7 million requests is more than one connection will see, and a v2 can add multiplexing without a new header.
 
-**Headers.** Two of HPACK's mechanisms: an index for the names we actually send, and length-prefixed literals for everything else. HPACK's dynamic table and Huffman coding are left out. A typical request is 57 bytes on the wire (8-byte header plus a 49-byte block). The same request in HTTP/1.1 text is 85 bytes.
+HPACK has a 61-entry static table of name–value pairs, a dynamic table, Huffman coding and prefix-coded integers. BHTTP/1 takes two of its ideas: names from a fixed table (as in HPACK's "literal with indexed name") and length-prefixed literals for everything else. Values are always literal, and the length prefix is a simpler one- or two-byte form. A typical request is 57 bytes on the wire (8-byte header plus a 49-byte block); the same request as HTTP/1.1 text is 85 bytes.
 
-**Evolving.** A v2 that wants new frame types or table entries first sends a new frame type, e.g. `SETTINGS`. A v1 peer skips it (§3) and never acknowledges it, so both sides stay on v1 and nothing breaks.
+To grow, a v2 peer would first send a new frame type, say SETTINGS, listing what it supports. A v1 peer skips it and never acknowledges it, so a v2 peer that gets its first response with no acknowledgement knows to stay with v1. No timer is needed.

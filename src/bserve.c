@@ -1,7 +1,7 @@
 /*
  * bserve - BHTTP/1 file server (Track 1).
  *
- *   usage: bserve [-v] <root-dir> <port>
+ *   usage: bserve [-v] [-t seconds] <root-dir> <port>
  *
  * Accepts TCP connections, reads binary request frames, maps :path to a file
  * under <root-dir>, and answers with a HEADERS frame plus DATA frames. The
@@ -24,24 +24,30 @@
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/time.h>
+#include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
 
-#define SERVER_NAME  "bserve/1.0"
-#define IDLE_TIMEOUT 30   /* seconds a keep-alive connection may sit idle */
+#define SERVER_NAME     "bserve/1.0"
+#define MAX_CHILDREN    64   /* concurrent connections; further accepts wait */
 
 static char  g_root[PATH_MAX];
 static FILE *g_trace;               /* stderr when -v, else NULL */
 static char  g_peer[64];
+/* -t: seconds a connection may wait for the next request, seconds to receive
+ * the rest of a request once it has started, and seconds a write may stall. */
+static int   g_timeout = 30;
 
+/* Log one line. Paths come from the peer, so escape control bytes. */
 static void logf_(const char *fmt, ...)
 {
+    char msg[1200], safe[4800];
     va_list ap;
     va_start(ap, fmt);
-    fprintf(stderr, "[bserve %d] %s ", (int)getpid(), g_peer);
-    vfprintf(stderr, fmt, ap);
-    fputc('\n', stderr);
+    vsnprintf(msg, sizeof msg, fmt, ap);
     va_end(ap);
+    fprintf(stderr, "[bserve %d] %s %s\n", (int)getpid(), g_peer,
+            bh_escape(msg, safe, sizeof safe));
 }
 
 static const char *reason(int status)
@@ -135,8 +141,10 @@ static int hexval(int c)
  */
 static int map_path(const char *path, char *out, size_t outsz)
 {
-    char dec[PATH_MAX];
+    char dec[BH_MAX_PATH + 1];
     size_t d = 0;
+    if (strlen(path) > BH_MAX_PATH)
+        return 400;
     /* Percent-decode up to the query/fragment. */
     for (const char *s = path; *s && *s != '?' && *s != '#'; s++) {
         int c = (unsigned char)*s;
@@ -182,7 +190,7 @@ static int map_path(const char *path, char *out, size_t outsz)
         return (errno == EACCES) ? 403 : 404;
     /* Symlinks must not lead outside the root. */
     size_t rl = strlen(g_root);
-    if (strncmp(real, g_root, rl) != 0 || (real[rl] != '/' && real[rl] != '\0'))
+    if (rl > 1 && (strncmp(real, g_root, rl) != 0 || (real[rl] != '/' && real[rl] != '\0')))
         return 403;
     if (stat(real, &st) != 0 || !S_ISREG(st.st_mode))
         return 404;
@@ -221,10 +229,12 @@ static int handle_request(int fd, uint32_t sid, const uint8_t *block, size_t len
         goto out;
     }
 
-    int ffd = open(file, O_RDONLY);
+    /* realpath() already resolved every link; O_NOFOLLOW stops a symlink
+     * swapped in since then, and fstat checks what we actually opened. */
+    int ffd = open(file, O_RDONLY | O_NOFOLLOW);
     struct stat st;
-    if (ffd < 0 || fstat(ffd, &st) != 0) {
-        int e = errno;
+    if (ffd < 0 || fstat(ffd, &st) != 0 || !S_ISREG(st.st_mode)) {
+        int e = ffd < 0 ? errno : ENOENT;
         if (ffd >= 0)
             close(ffd);
         rc = send_error(fd, sid, e == EACCES ? 403 : 404, path, head);
@@ -260,10 +270,10 @@ out:
     return rc;
 }
 
-/* A framing-level error: answer 400 on the offending stream, then hang up. */
-static void connection_error(int fd, uint32_t sid, const char *why)
+/* A connection error (SPEC §6): report it as a 400 on stream 0, then hang up. */
+static void connection_error(int fd, const char *why)
 {
-    send_error(fd, sid, 400, why, 0);
+    send_error(fd, 0, 400, why, 0);
     shutdown(fd, SHUT_WR);
 }
 
@@ -273,18 +283,21 @@ static void serve_connection(int fd)
     logf_("connected");
     for (;;) {
         bh_frame f;
+        bh_set_deadline(g_timeout);
         int r = bh_next_frame(fd, &f, g_trace);
+        bh_set_deadline(g_timeout);
         if (r == 1) {
             logf_("client closed connection");
             break;
         }
         if (r < 0) {
-            logf_("connection dropped (read error, timeout or truncated frame)");
+            logf_("connection dropped (%s)", errno == ETIMEDOUT || errno == EAGAIN
+                  ? "timed out" : "read error or truncated frame");
             break;
         }
         if (f.type == BH_DATA) {
             bh_read_payload(fd, &f, NULL, g_trace);
-            connection_error(fd, f.stream, "DATA frame outside of a request");
+            connection_error(fd, "DATA frame outside of a request");
             break;
         }
         /* HEADERS: a new request. */
@@ -301,7 +314,7 @@ static void serve_connection(int fd)
          * away the 400 we are about to send. */
         if (f.stream == 0 || f.stream <= last_sid) {
             free(block);
-            connection_error(fd, f.stream, "stream id must be non-zero and increasing");
+            connection_error(fd, "stream id must be non-zero and increasing");
             break;
         }
         last_sid = f.stream;
@@ -317,9 +330,8 @@ static void serve_connection(int fd)
                 break;
             }
             if (d.type != BH_DATA || d.stream != f.stream) {
-                if (d.length <= BH_MAX_HEADER_BLOCK)
-                    bh_read_payload(fd, &d, NULL, g_trace);
-                connection_error(fd, f.stream, "expected DATA for the open request");
+                bh_read_payload(fd, &d, NULL, g_trace);
+                connection_error(fd, "expected DATA for the open request");
                 bad = -1;
                 break;
             }
@@ -404,12 +416,19 @@ static void peer_name(const struct sockaddr_storage *ss)
 int main(int argc, char **argv)
 {
     int argi = 1;
-    if (argi < argc && strcmp(argv[argi], "-v") == 0) {
-        g_trace = stderr;
-        argi++;
+    for (; argi < argc && argv[argi][0] == '-'; argi++) {
+        if (strcmp(argv[argi], "-v") == 0) {
+            g_trace = stderr;
+        } else if (strcmp(argv[argi], "-t") == 0 && argi + 1 < argc &&
+                   (g_timeout = atoi(argv[argi + 1])) > 0) {
+            argi++;
+        } else {
+            argi = argc;        /* force the usage message */
+            break;
+        }
     }
     if (argc - argi != 2) {
-        fprintf(stderr, "usage: %s [-v] <root-dir> <port>\n", argv[0]);
+        fprintf(stderr, "usage: %s [-v] [-t seconds] <root-dir> <port>\n", argv[0]);
         return 1;
     }
     if (!realpath(argv[argi], g_root)) {
@@ -423,20 +442,25 @@ int main(int argc, char **argv)
     }
 
     signal(SIGPIPE, SIG_IGN);   /* a vanished client must not kill us */
-    signal(SIGCHLD, SIG_IGN);   /* children are reaped automatically */
 
     int lfd = listen_on(argv[argi + 1]);
     if (lfd < 0)
         return 1;
     fprintf(stderr, "bserve: serving %s on port %s (BHTTP/1)\n", g_root, argv[argi + 1]);
 
+    int children = 0;
     for (;;) {
+        /* Reap finished children; at the cap, block until one exits. */
+        while (children > 0 && waitpid(-1, NULL, children >= MAX_CHILDREN ? 0 : WNOHANG) > 0)
+            children--;
         struct sockaddr_storage ss;
         socklen_t sl = sizeof ss;
         int cfd = accept(lfd, (struct sockaddr *)&ss, &sl);
         if (cfd < 0) {
             if (errno != EINTR)
                 perror("bserve: accept");
+            if (errno == EMFILE || errno == ENFILE)
+                usleep(100000);     /* out of descriptors: back off, don't spin */
             continue;
         }
         pid_t pid = fork();
@@ -444,14 +468,16 @@ int main(int argc, char **argv)
             close(lfd);
             peer_name(&ss);
             int one = 1;
-            struct timeval tv = { IDLE_TIMEOUT, 0 };
+            struct timeval tv = { g_timeout, 0 };
             setsockopt(cfd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
-            setsockopt(cfd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+            setsockopt(cfd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv);
             serve_connection(cfd);
             _exit(0);
         }
         if (pid < 0)
             perror("bserve: fork");
+        else
+            children++;
         close(cfd);
     }
 }

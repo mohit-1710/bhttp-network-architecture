@@ -2,18 +2,19 @@
 """
 Interop tests for BHTTP/1.
 
-This file is a second, independent implementation of the spec written in
-Python (it shares no code with src/). It plays client against ./bserve and
-server against ./bcurl, so the C programs are tested against the *protocol*,
-not just against each other.
+A second implementation of SPEC.md in Python, sharing no code with src/. It
+plays client against ./bserve and server against ./bcurl, so a mistake made
+the same way in bserve.c and bcurl.c still shows up as a failure.
 
     python3 tests/interop.py          (run from the repo root, after `make`)
 """
 import os
+import shutil
 import socket
 import struct
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 
@@ -81,6 +82,15 @@ def recv_frame(sock):
     length = h[0] << 16 | h[1] << 8 | h[2]
     stream = h[5] << 16 | h[6] << 8 | h[7]
     return h[3], h[4], stream, recv_exact(sock, length)
+
+def closed_by_peer(sock, wait=5):
+    sock.settimeout(wait)
+    try:
+        return sock.recv(1) == b""
+    except ConnectionResetError:
+        return True
+    except socket.timeout:
+        return False
 
 def recv_response(sock, sid):
     """Read one response, skipping unknown frame types as the spec requires."""
@@ -220,12 +230,82 @@ def test_server():
         st, _, _ = recv_response(s, 16)
         check("literal header name accepted", st == 200)
 
-        # Stream id going backwards is a connection error: 400, then close.
+        # Many fields: only the 64 KiB block limit applies, not a field count.
+        many = [(f"x-f{i}", "v") for i in range(300)]
+        request(s, 17, "/hi.txt", extra=many)
+        st, _, _ = recv_response(s, 17)
+        check("300 header fields accepted", st == 200)
+
+        block = enc_headers([(":method", "GET"), (":path", "/hi.txt")])
+        while len(block) < 65536:             # pad with literal fields to exactly 64 KiB
+            left = 65536 - len(block)
+            n = left - 4 if left - 4 < 128 else min(0x7FFF, left - 5)
+            if 0 < 65536 - len(block) - (n + (4 if n < 128 else 5)) < 6:
+                n -= 10                        # leave room for one more whole field
+            block += enc_headers([("x", "a" * n)])
+        s.sendall(frame(HEADERS, END_STREAM, 18, block))
+        st, _, _ = recv_response(s, 18)
+        check("header block of exactly 65536 bytes accepted", len(block) == 65536 and st == 200)
+
+        s.sendall(frame(HEADERS, END_STREAM, 19, block + b"\x00\x01y\x00"))
+        st, _, _ = recv_response(s, 19)
+        check("header block over 65536 bytes -> 400", st == 400)
+
+        s.sendall(frame(HEADERS, END_STREAM, 20,
+                        enc_headers([("accept", "*/*"), (":method", "GET"), (":path", "/hi.txt")])))
+        st, _, _ = recv_response(s, 20)
+        check("pseudo-header after a regular field -> 400", st == 400)
+
+        s.sendall(frame(HEADERS, END_STREAM, 21, b"\x01\x80\x03GET\x02\x07/hi.txt"))
+        st, _, _ = recv_response(s, 21)
+        check("non-minimal two-byte length accepted", st == 200)
+
+        request(s, 22, "/" + "a" * 1100)
+        st, _, _ = recv_response(s, 22)
+        check(":path over 1024 bytes -> 400", st == 400)
+
+        request(s, 23, "/hi.txt?x=1#frag")
+        st, _, body = recv_response(s, 23)
+        check("query and fragment ignored", st == 200 and body == b"hi\n")
+
+        request(s, 24, "/bad%zzescape")
+        st, _, _ = recv_response(s, 24)
+        check("invalid percent escape -> 400", st == 400)
+
+        # Stream id going backwards is a connection error: 400 on stream 0, then close.
         request(s, 3, "/index.html")
-        st, _, _ = recv_response(s, 3)
-        s.settimeout(3)
-        closed = s.recv(1) == b""
-        check("non-increasing stream id -> 400 and connection closed", st == 400 and closed)
+        st, _, _ = recv_response(s, 0)
+        check("non-increasing stream id -> 400 on stream 0, connection closed",
+              st == 400 and closed_by_peer(s))
+        s.close()
+
+        s = connect(port)
+        s.sendall(frame(DATA, END_STREAM, 7, b"stray"))
+        st, _, _ = recv_response(s, 0)
+        check("DATA outside a request -> 400 on stream 0, connection closed",
+              st == 400 and closed_by_peer(s))
+        s.close()
+
+        s = connect(port)
+        s.sendall(frame(HEADERS, END_STREAM, 0, enc_headers([(":method", "GET"), (":path", "/")])))
+        st, _, _ = recv_response(s, 0)
+        check("HEADERS on stream 0 -> 400 on stream 0, connection closed",
+              st == 400 and closed_by_peer(s))
+        s.close()
+
+        s = connect(port)
+        s.sendall(frame(HEADERS, 0, 1, enc_headers([(":method", "GET"), (":path", "/")])))
+        s.sendall(frame(HEADERS, END_STREAM, 2, enc_headers([(":method", "GET"), (":path", "/")])))
+        st, _, _ = recv_response(s, 0)
+        check("new HEADERS while a request body is open -> connection error",
+              st == 400 and closed_by_peer(s))
+        s.close()
+
+        # A frame cut short by EOF: the server just closes.
+        s = connect(port)
+        s.sendall(frame(HEADERS, END_STREAM, 1, enc_headers([(":method", "GET"), (":path", "/")]))[:-3])
+        s.shutdown(socket.SHUT_WR)
+        check("truncated frame then EOF -> server closes", closed_by_peer(s))
         s.close()
 
         # Large file spans many DATA frames.
@@ -246,6 +326,13 @@ def test_server():
         finally:
             os.remove(big)
 
+        # Pipelining: two requests before reading either response.
+        s = connect(port)
+        request(s, 1, "/hi.txt"); request(s, 2, "/about.html")
+        a, b = recv_response(s, 1), recv_response(s, 2)
+        check("pipelined requests answered in order", a[0] == 200 and b[0] == 200)
+        s.close()
+
         # Two clients at once.
         a, b = connect(port), connect(port)
         request(a, 1, "/hi.txt"); request(b, 1, "/hi.txt")
@@ -254,6 +341,62 @@ def test_server():
     finally:
         srv.terminate()
         srv.wait()
+
+# ------------------------------------------ root containment, timeouts ---
+
+def test_root_and_timeouts():
+    print("bserve: root containment and timeouts")
+    tmp = tempfile.mkdtemp()
+    try:
+        root, sib = os.path.join(tmp, "www"), os.path.join(tmp, "www-sib")
+        os.mkdir(root); os.mkdir(sib)
+        open(os.path.join(root, "ok.txt"), "w").write("ok\n")
+        open(os.path.join(sib, "secret.txt"), "w").write("secret\n")
+        open(os.path.join(tmp, "outside.txt"), "w").write("outside\n")
+        os.symlink(os.path.join(tmp, "outside.txt"), os.path.join(root, "out-link"))
+        os.symlink(sib, os.path.join(root, "sib-link"))
+        os.symlink("ok.txt", os.path.join(root, "in-link"))
+        port = free_port()
+        srv = subprocess.Popen([BSERVE, "-t", "2", root, str(port)], stderr=subprocess.DEVNULL)
+        try:
+            s = connect(port)
+            request(s, 1, "/out-link")
+            check("symlink to a file outside the root -> 403", recv_response(s, 1)[0] == 403)
+            request(s, 2, "/sib-link/secret.txt")
+            check("symlink into a sibling dir sharing the root's prefix -> 403",
+                  recv_response(s, 2)[0] == 403)
+            request(s, 3, "/in-link")
+            st, _, body = recv_response(s, 3)
+            check("symlink staying inside the root is served", st == 200 and body == b"ok\n")
+            s.close()
+
+            # Idle connection is closed after the timeout (2 s here).
+            s = connect(port)
+            t0 = time.monotonic()
+            closed = closed_by_peer(s, wait=6)
+            check("idle connection closed after -t seconds", closed and time.monotonic() - t0 < 5)
+            s.close()
+
+            # Trickling one byte at a time does not keep a request alive.
+            s = connect(port)
+            data = frame(HEADERS, END_STREAM, 1, enc_headers([(":method", "GET"), (":path", "/ok.txt")]))
+            t0, dropped = time.monotonic(), False
+            for byte in data:
+                try:
+                    s.sendall(bytes([byte]))
+                except OSError:
+                    dropped = True
+                    break
+                time.sleep(0.5)
+                if time.monotonic() - t0 > 6:
+                    break
+            check("slow sender is cut off by the request deadline", dropped or closed_by_peer(s, wait=1))
+            s.close()
+        finally:
+            srv.terminate()
+            srv.wait()
+    finally:
+        shutil.rmtree(tmp)
 
 # -------------------------------------------- bcurl -> python server -----
 
@@ -293,10 +436,15 @@ class FakeServer:
     def close(self):
         self.sock.close()
 
-def resp(status, body, chunks=1, grease=False):
+def raw(data_fn):
+    def send(c, sid):
+        c.sendall(data_fn(sid))
+    return send
+
+def resp(status, body, chunks=1, grease=False, extra=()):
     def send(c, sid):
         hb = enc_headers([(":status", str(status)), ("content-length", str(len(body))),
-                          ("x-literal-header", "fine")])
+                          ("x-literal-header", "fine")] + list(extra))
         out = frame(0xEE, 0, 0, b"v2 says hello") if grease else b""
         out += frame(HEADERS, 0 if body else END_STREAM, sid, hb)
         if body:
@@ -319,6 +467,15 @@ def test_client():
         "/empty": resp(204, b""),
         "/teapot": resp(418, b"short and stout\n"),
         "/boom": resp(503, b"down\n"),
+        "/many": resp(200, b"ok\n", extra=[(f"x-h{i}", "v") for i in range(100)]),
+        "/escape": resp(200, b"ok\n", extra=[("x-evil", "\x1b]0;pwned\x07\x1b[2J")]),
+        "/plus": raw(lambda sid: frame(HEADERS, END_STREAM, sid, enc_headers([(":status", "+20")]))),
+        "/s0": raw(lambda sid: frame(HEADERS, 0, 0, enc_headers([(":status", "400")])) +
+                   frame(DATA, END_STREAM, 0, b"400 Bad Request\nyou did something odd\n")),
+        "/wrong": raw(lambda sid: frame(HEADERS, END_STREAM, sid + 5, enc_headers([(":status", "200")]))),
+        "/data-first": raw(lambda sid: frame(DATA, END_STREAM, sid, b"x")),
+        "/silent": raw(lambda sid: b""),
+        "/big": resp(200, b"z" * 2_000_000, chunks=200),
         "*": resp(404, b"nope\n"),
     })
     try:
@@ -355,6 +512,46 @@ def test_client():
 
         r = bcurl("127.0.0.1:1/x")
         check("connection refused -> exit 2", r.returncode == 2)
+
+        r = bcurl(f"{base}/many")
+        check("response with 100+ header fields accepted", r.returncode == 0 and r.stdout == b"ok\n")
+
+        r = bcurl("-v", f"{base}/escape")
+        check("-v escapes control bytes from the peer", r.returncode == 0 and b"\x1b" not in r.stderr
+              and b"\\x1b" in r.stderr)
+
+        r = bcurl(f"{base}/plus")
+        check(":status that is not three digits -> exit 3", r.returncode == 3)
+
+        r = bcurl(f"{base}/s0")
+        check("400 on stream 0 (connection error) -> exit 3 with the reason",
+              r.returncode == 3 and b"you did something odd" in r.stderr)
+
+        r = bcurl(f"{base}/wrong")
+        check("response on the wrong stream -> exit 3", r.returncode == 3)
+
+        r = bcurl(f"{base}/data-first")
+        check("DATA before HEADERS -> exit 3", r.returncode == 3)
+
+        r = bcurl("-t", "1", f"{base}/silent")
+        check("server that never answers -> exit 3 after -t", r.returncode == 3)
+
+        r = subprocess.run(f"{BCURL} {base}/big >&-", shell=True, capture_output=True, timeout=10)
+        check("stdout closed -> exit 3", r.returncode == 3)
+
+        before = fs.accepts
+        r = bcurl(f"{base}/ok", *(["/ok"] * 299))
+        check("300 requests on one connection, none dropped",
+              r.returncode == 0 and r.stdout == b"hello world\n" * 300 and fs.accepts - before == 1)
+
+        r = bcurl(f"http://{base}/ok")
+        check("http:// scheme -> usage error", r.returncode == 1)
+
+        r = bcurl("-H", "Bad Name: x", f"{base}/ok")
+        check("invalid -H name -> usage error", r.returncode == 1)
+
+        r = bcurl("-H", "x-ok: a\nb", f"{base}/ok")
+        check("-H value with a newline -> usage error", r.returncode == 1)
     finally:
         fs.close()
 
@@ -380,6 +577,7 @@ if __name__ == "__main__":
         if not os.access(exe, os.X_OK):
             sys.exit(f"{exe} not built; run `make` first")
     test_server()
+    test_root_and_timeouts()
     test_client()
     test_end_to_end()
     print(f"\n{PASS} passed, {FAIL} failed")
