@@ -7,7 +7,7 @@ MUST, MUST NOT, SHOULD, RECOMMENDED and MAY are used as in RFC 2119 and RFC 8174
 
 ## 1. Connection
 
-BHTTP/1 runs over one TCP connection (default port 9000). The server answers requests in order on the connection they came in on. A client sends all of one invocation's requests on one connection and MUST NOT open a second. If it closes early, the client reports an error rather than reconnecting. A client SHOULD wait for each response before sending the next request, but a server MUST also accept pipelined requests. It reads each request completely before answering it. A server MAY refuse a connection by closing it at once; otherwise it closes only after a connection error (§6), after a body it cannot finish (§4), when a request takes too long to arrive or the client stops taking response frames, or when no request has been in progress for a while (at least 10 s RECOMMENDED; unknown frames do not count as activity). Unless a body fails or the client stops taking frames, it never closes with a fully received request unanswered, so a request with no response was not processed.
+BHTTP/1 runs over one TCP connection (default port 9000). The server answers requests in order on the connection they came in on. A client sends all the requests of one run on one connection and MUST NOT open a second. If it closes early, the client reports an error rather than reconnecting. A client SHOULD wait for each response before sending the next request, but a server MUST also accept pipelined requests. It reads each request completely before answering it. A server MAY refuse a connection by closing it at once; otherwise it closes only after a connection error (§6), after a body it cannot finish (§4), when a request takes too long to arrive or the client stops taking response frames, or when no request has been in progress for a while (at least 10 s RECOMMENDED; unknown frames do not count as activity). Unless a body fails or the client stops taking frames, it never closes with a fully received request unanswered, so a request with no response was not processed.
 
 ## 2. Frame header
 
@@ -61,7 +61,7 @@ Tag 0 means the name follows as a literal. Tags 1 to 10 name the fields of a pla
 
 ## 6. Server
 
-The server cuts `:path` at the first `?` or `#` and decodes `%XX` escapes (`%2F` is a slash, `%2e%2e` is `..`). A directory, or a path ending in `/`, means its `index.html`. Every response carries `content-type`, `content-length`, `server` and `date`; a found file gets `200` and the file as DATA, an error a short `text/plain` body, and HEAD no DATA. The first matching row below decides. A segment is a piece of the decoded path between slashes; resolved means after following symbolic links.
+The server cuts `:path` at the first `?` or `#` and decodes `%XX` escapes (`%2F` is a slash, `%2e%2e` is `..`). A directory, or a path ending in `/`, means its `index.html`. Every response carries `content-type`, `content-length`, `server` and `date`; a found file gets `200` and the file as DATA, an error a short `text/plain` body, and HEAD no DATA (its `content-length` is the file's size). The first matching row below decides. A segment is a piece of the decoded path between slashes; resolved means with symlinks followed.
 
 | # | status | when |
 |---|----|------------------------------------------------------------|
@@ -69,19 +69,19 @@ The server cuts `:path` at the first `?` or `#` and decodes `%XX` escapes (`%2F`
 | 2 | 405 | a well-formed method other than GET or HEAD |
 | 3 | 403 | a segment equal to `..` |
 | 4 | 404 | any other segment starting with a dot (`.`, `.env`) |
-| 5 | 403 | the resolved path lies outside the root, or the server may not read it |
-| 6 | 404 | the resolved path has a component starting with a dot, or is not a regular file |
+| 5 | 403 | the resolved path, or its existing part, is outside the root, or the server may not read it |
+| 6 | 404 | a missing or unresolvable path (a file plus `/` included), a resolved dot component, or not a regular file |
 | 7 | 500 | the file cannot be opened or read for any other reason |
 
-These are stream errors: the response goes on the request's stream (after any request body is read and discarded) and the connection stays open. Connection errors, where the frame sequence can no longer be trusted, are: HEADERS on stream 0 or with an ID not higher than the last; DATA with no request open or on a different stream; or a new HEADERS before the open request's END_STREAM. After answering requests completed before the bad frame, the server sends the connection-error message on stream 0 (HEADERS with `:status` 400, then DATA holding the reason, the last with END_STREAM) and closes. If a frame is cut off by EOF, the server just closes.
+These are stream errors: the response goes on the request's stream (after any request body is read and discarded) and the connection stays open. Connection errors, where the frame sequence can no longer be trusted, are: HEADERS on stream 0 or with an ID not higher than the last; DATA with no request open or on a different stream; or a new HEADERS before the open request's END_STREAM. After answering requests completed before the bad frame, the server sends the connection-error message on stream 0, an ordinary 400 response (§4, §5) whose body is the reason, and closes. On EOF inside a frame or an unfinished request, the server just closes.
 
 ## 7. Client
 
-The client matches responses to requests in order. A HEADERS frame on stream 0, at any point, starts a connection-error message; the client reads it and its DATA, reports the reason and stops. These are protocol errors, after which the client closes the connection: a HEADERS or DATA frame for any stream other than the oldest unanswered request; DATA before HEADERS or after END_STREAM; a second HEADERS in one response; DATA in a response to HEAD; a malformed or oversized response header block; a `content-length` mismatch; a frame cut off by EOF; and a read timeout.
+The client matches responses to requests in order. A HEADERS frame on stream 0, at any point, starts a connection-error message; the client reads it and its DATA, reports the reason and stops. These are protocol errors, after which the client closes the connection: a HEADERS or DATA frame for any stream other than the oldest unanswered request; DATA before HEADERS or after END_STREAM; a second HEADERS in one response; DATA in a response to HEAD; a malformed or oversized response header block; a `content-length` mismatch; EOF while a response is unfinished; and a read timeout.
 
 ## 8. Design notes
 
-HTTP/2's header is Length 24, Type 8, Flags 8, then a reserved bit and a 31-bit Stream ID: 9 bytes. Its drafts used 8 bytes (a 16-bit Length in draft 04, 14 bits plus two reserved bits in draft 13) until draft 14 (2014) widened Length to 24 bits so a receiver can opt in to larger frames for bulk transfer; the default stays 2^14 so one big frame cannot delay the others. Flags are defined per frame type, so 8 bits are enough. The 31-bit Stream ID is a 32-bit word minus a reserved bit with no meaning (RFC 9113 §4.1); both ends start streams (client odd, server even), giving the client 2^30 IDs and the server 2^30 − 1. BHTTP/1 uses 24 / 8 / 8 / 24 (8 bytes):
+HTTP/2's header is Length 24, Type 8, Flags 8, then a reserved bit and a 31-bit Stream ID: 9 bytes. Its drafts used 8 bytes (a 16-bit Length in draft 04, 14 bits plus two reserved bits in draft 13) until draft 14 (2014) widened Length to 24 bits, letting a receiver opt in to larger frames. The 2^14 default stops one big frame delaying the others. Flags are defined per frame type, so 8 bits are enough. The 31-bit Stream ID is a 32-bit word minus a reserved bit with no meaning (RFC 9113 §4.1); both ends start streams (client odd, server even), giving the client 2^30 IDs and the server 2^30 − 1. BHTTP/1 uses 24 / 8 / 8 / 24:
 
 * Length 24. v1's sizes (16 KiB DATA recommended, header blocks at most 64 KiB − 1) fit in 16 bits; the extra byte allows larger frames now and in v2. Its width can never change, since §3's skipping relies on every version reading Length alike.
 * Type 8 and Flags 8. Whole bytes need no bit masking, and with Length they fill the first 32-bit word exactly, the Stream ID the second. v1 uses two types and one flag. A v2 can add frame types freely (§3), but a v1 peer would ignore a new flag and reject a new tag, so those need agreement first (below).
@@ -89,4 +89,4 @@ HTTP/2's header is Length 24, Type 8, Flags 8, then a reserved bit and a 31-bit 
 
 From HPACK (static and dynamic tables, Huffman coding, prefix-coded integers) BHTTP/1 takes two ideas: names from a fixed table (HPACK's "literal with indexed name") and length-prefixed literals. It indexes names only, since most values here (paths, dates, lengths) change on every message.
 
-With no preface, a misdirected HTTP/1.1 `GET /` reads as an unknown frame of Length 0x474554 and is skipped until the idle limit; v1 accepts that rather than add a preface to every connection. To grow, a v2 client first sends a new frame type, which a v2 server acknowledges before its first response and a v1 server skips.
+With no preface, a misdirected HTTP/1.1 `GET /` reads as an unknown frame of Length 0x474554 and is skipped until the idle limit, a slow failure v1 accepts. To grow, a v2 client first sends a new frame type, which a v2 server acknowledges before its first response and a v1 server skips.

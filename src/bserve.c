@@ -41,6 +41,7 @@ static char  g_peer[64];
 static int   g_timeout = 30;
 
 /* Log one line. Paths come from the peer, so escape control bytes. */
+static void logf_(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 static void logf_(const char *fmt, ...)
 {
     char msg[1200], safe[4800];
@@ -161,6 +162,48 @@ static int decode_path(const char *path, char *dec, size_t decsz)
     return 0;
 }
 
+static int inside_root(const char *real)
+{
+    size_t rl = strlen(g_root);
+    if (rl == 1)
+        rl = 0;                         /* root "/" */
+    return strncmp(real, g_root, rl) == 0 && (real[rl] == '/' || real[rl] == '\0');
+}
+
+/* For a path that does not resolve: does what exists of it already lead
+ * outside the root? Follows a dangling symlink's target and otherwise the
+ * longest existing prefix, so a 404 never confirms anything out there. */
+static int leads_outside(const char *path, int depth)
+{
+    char real[PATH_MAX], part[PATH_MAX + BH_MAX_PATH + 16];
+    if (depth > 8 || strlen(path) >= sizeof part)
+        return 1;                       /* too many links to tell: treat as outside */
+    if (realpath(path, real))
+        return !inside_root(real);
+    struct stat st;
+    if (lstat(path, &st) == 0 && S_ISLNK(st.st_mode)) {
+        char target[PATH_MAX];
+        ssize_t n = readlink(path, target, sizeof target - 1);
+        if (n < 0)
+            return 1;
+        target[n] = '\0';
+        if (target[0] == '/') {
+            strcpy(part, target);
+        } else {                        /* relative to the link's directory */
+            strcpy(part, path);
+            char *slash = strrchr(part, '/');
+            snprintf(slash + 1, sizeof part - (size_t)(slash + 1 - part), "%s", target);
+        }
+        return leads_outside(part, depth + 1);
+    }
+    strcpy(part, path);
+    char *slash = strrchr(part, '/');
+    if (!slash || slash == part)
+        return 0;
+    *slash = '\0';
+    return leads_outside(part, depth);  /* only symlink hops count as depth */
+}
+
 /*
  * Map a decoded path to a regular file under g_root.
  * Returns 0 and fills out (at least PATH_MAX bytes) on success, else 403/404.
@@ -195,13 +238,16 @@ static int resolve_path(const char *dec, char *out)
     }
 
     char real[PATH_MAX];
-    if (!realpath(full, real))
-        return (errno == EACCES) ? 403 : 404;
+    if (!realpath(full, real)) {
+        if (errno == EACCES)
+            return 403;
+        return leads_outside(full, 0) ? 403 : 404;
+    }
     /* Symlinks must not lead outside the root. */
     size_t rl = strlen(g_root);
     if (rl == 1)
         rl = 0;                         /* root "/" */
-    if (strncmp(real, g_root, rl) != 0 || (real[rl] != '/' && real[rl] != '\0'))
+    if (!inside_root(real))
         return 403;
     /* Nor to a hidden file or directory inside it. */
     if (strstr(real + rl, "/."))
@@ -250,9 +296,11 @@ static int handle_request(int fd, uint32_t sid, const uint8_t *block, size_t len
         goto out;
     }
 
-    /* realpath() already resolved every link; O_NOFOLLOW stops a symlink
-     * swapped in since then, O_NONBLOCK stops a FIFO swapped in from
-     * blocking us, and fstat checks what we actually opened. */
+    /* realpath() already resolved every link. O_NOFOLLOW stops the last
+     * component being swapped for a symlink since then (a swapped parent
+     * directory is not caught; that needs write access to the root),
+     * O_NONBLOCK stops a FIFO from blocking us, and fstat checks what we
+     * actually opened. */
     int ffd = open(file, O_RDONLY | O_NOFOLLOW | O_NONBLOCK);
     struct stat st;
     if (ffd < 0 || fstat(ffd, &st) != 0 || !S_ISREG(st.st_mode)) {
@@ -309,8 +357,8 @@ static void connection_error(int fd, const char *why)
     /* Every read waits through bh_read_full, so the 2 s deadline holds even
      * if the client sends one more byte and then goes quiet. */
     bh_set_deadline(2);
-    char junk[1];
-    while (bh_read_full(fd, junk, 1) == 0)
+    char junk[4096];
+    while (bh_read_full(fd, junk, 1) == 0 && recv(fd, junk, sizeof junk, MSG_DONTWAIT) != 0)
         ;
 }
 
@@ -557,6 +605,15 @@ int main(int argc, char **argv)
         }
         char addr[INET6_ADDRSTRLEN];
         peer_addr(&ss, addr, sizeof addr);
+        /* Children whose client just hung up may not be reaped yet: give
+         * them a moment so a client that closed its connections is not
+         * counted against itself. */
+        for (int tries = 0; count_client(addr) >= MAX_PER_CLIENT && tries < 20; tries++) {
+            while ((done = waitpid(-1, NULL, WNOHANG)) > 0)
+                forget_child(done);
+            if (count_client(addr) >= MAX_PER_CLIENT)
+                usleep(10000);
+        }
         if (count_client(addr) >= MAX_PER_CLIENT) {
             /* One address may not hold every slot. */
             fprintf(stderr, "[bserve] %s already has %d connections; closing new one\n",

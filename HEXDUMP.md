@@ -1,6 +1,6 @@
 # Annotated hexdumps: a GET, a 404, a skipped frame and a 400
 
-The first section is a single GET between `./bcurl` and `./bserve ./www 9000`; later sections show a 404, a skipped frame and a 400, in that order. The request asks for `/hello.txt`, a 20-byte file containing `Hello, binary HTTP!\n`. I added one header that is not in the static table (`-H 'x-trace-id: 7f3a'`) so the dump also shows a literal name:
+Captured from `./bcurl` against `./bserve ./www 9000`. The request asks for `/hello.txt`, a 20-byte file containing `Hello, binary HTTP!\n`. I added one header that is not in the static table (`-H 'x-trace-id: 7f3a'`) so the dump also shows a literal name:
 
 ```
 ./bcurl -v -H 'x-trace-id: 7f3a' localhost:9000/hello.txt
@@ -41,7 +41,7 @@ Header block. Each field is a tag byte, then a literal name only when the tag is
 | 0x2c | `06` `03` `2a 2f 2a` | tag 6 `accept`, length 3, `*/*` |
 | 0x31 | `00` | tag 0: the name is a literal |
 | 0x32 | `0a` `78 2d 74 72 61 63 65 2d 69 64` | name length 10, `x-trace-id` |
-| 0x3d | `04` `37 66 33 61` | value length 4, `7f3a`, which ends at 0x41 (the 66th byte) |
+| 0x3d | `04` `37 66 33 61` | value length 4, `7f3a`, which ends at 0x41, the last of the 66 bytes |
 
 The pseudo-headers come first, as §5 requires. The five table fields cost 5 + 12 + 16 + 11 + 5 = 49 bytes. The literal costs 1 + 1 + 10 + 1 + 4 = 17, because it carries its name. 49 + 17 = 66 = 0x42, the Length in the header. Without `-H` the whole request frame is 57 bytes (8 + 49); the same request as HTTP/1.1 text is 85 bytes.
 
@@ -95,7 +95,7 @@ After END_STREAM the client could have sent stream 2 on the same socket. It had 
 
 ## A 404 with a two-byte length
 
-Every string above is shorter than 128 bytes, so each length took one byte with the top bit clear. Longer strings set the top bit and use 15 bits across two bytes: 127 is `7f`, 128 is `80 80`, 300 is `81 2c` and the largest, 32 767, is `ff ff`. Asking for a file that does not exist, with a 140-byte name, shows the two-byte form and an error response in one exchange:
+Every string above is shorter than 128 bytes, so each length took one byte with the top bit clear. Longer strings set the top bit and use 15 bits across two bytes: 127 is `7f`, 128 is `80 80`, 300 is `81 2c` and the largest, 32 767, is `ff ff`. Asking for a file that does not exist, with a name I made up to be 140 bytes long, also gives a 404, so one capture shows both:
 
 ```
 ./bcurl -v localhost:9000/notes/2026/week-6/binary-framing-lab-log-with-every-request-and-response-sent-while-testing-the-server-on-tuesday-evening-in-lab-3-rm-b.txt
@@ -214,7 +214,7 @@ bcurl wrote the 155-byte body to stdout and exited with 4 because the status was
 
 ## A 400, seen from the server
 
-A malformed request needs a hand-made frame, since bcurl only sends valid ones. This is the view from `bserve -v ./www 9000` (`<` received, `>` sent) of a client that sent a valid `:method` and `:path` followed by tag `0b`, which v1 does not define (§5).
+A malformed request needs a hand-made frame, since bcurl only sends valid ones, so I sent this one from a few lines of Python. This is the view from `bserve -v ./www 9000` (`<` received, `>` sent) of a client that sent a valid `:method` and `:path` followed by tag `0b`, which v1 does not define (§5).
 
 | bytes | meaning |
 |---|---|
@@ -225,7 +225,7 @@ A malformed request needs a hand-made frame, since bcurl only sends valid ones. 
 | reply `03 03 34 30 30 …` | `:status` `400` on stream 1, `content-length` 39 |
 | reply DATA, 39 bytes | `400 Bad Request\nmalformed header block\n` |
 
-It is a stream error, so bserve answers on stream 1 and keeps reading; the connection closes only when the client hangs up.
+It is a stream error, so bserve answers on stream 1 and keeps reading. Here the client hung up next; otherwise the connection would stay open until the idle limit.
 
 ```
 bserve: serving /Users/mohit/sst/network_architecture/www on port 9000 (BHTTP/1)

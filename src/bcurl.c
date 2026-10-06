@@ -309,8 +309,8 @@ static void report_connection_error(int fd, const bh_frame *f)
         end = d.flags & BH_FLAG_END_STREAM;
     }
     msg[used] = '\0';
-    fprintf(stderr, "bcurl: server reported a connection error: %s\n",
-            bh_escape(msg, safe, sizeof safe));
+    fprintf(stderr, "bcurl: server reported a connection error: %s%s\n",
+            bh_escape(msg, safe, sizeof safe), used == sizeof msg - 1 ? " ...(truncated)" : "");
 }
 
 /* Read one response on stream sid. Returns the status code, or -1. */

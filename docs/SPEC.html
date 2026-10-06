@@ -51,11 +51,11 @@ bytes.</p>
 <h2 id="connection">1. Connection</h2>
 <p>BHTTP/1 runs over one TCP connection (default port 9000). The server
 answers requests in order on the connection they came in on. A client
-sends all of one invocation&#39;s requests on one connection and MUST NOT
-open a second. If it closes early, the client reports an error rather
-than reconnecting. A client SHOULD wait for each response before sending
-the next request, but a server MUST also accept pipelined requests. It
-reads each request completely before answering it. A server MAY refuse a
+sends all the requests of one run on one connection and MUST NOT open a
+second. If it closes early, the client reports an error rather than
+reconnecting. A client SHOULD wait for each response before sending the
+next request, but a server MUST also accept pipelined requests. It reads
+each request completely before answering it. A server MAY refuse a
 connection by closing it at once; otherwise it closes only after a
 connection error (§6), after a body it cannot finish (§4), when a
 request takes too long to arrive or the client stops taking response
@@ -211,9 +211,10 @@ ending in <code>/</code>, means its <code>index.html</code>. Every
 response carries <code>content-type</code>, <code>content-length</code>,
 <code>server</code> and <code>date</code>; a found file gets
 <code>200</code> and the file as DATA, an error a short
-<code>text/plain</code> body, and HEAD no DATA. The first matching row
+<code>text/plain</code> body, and HEAD no DATA (its
+<code>content-length</code> is the file&#39;s size). The first matching row
 below decides. A segment is a piece of the decoded path between slashes;
-resolved means after following symbolic links.</p>
+resolved means with symlinks followed.</p>
 <table>
 <colgroup>
 <col style="width: 4%" />
@@ -253,14 +254,14 @@ resolved means after following symbolic links.</p>
 <tr>
 <td>5</td>
 <td>403</td>
-<td>the resolved path lies outside the root, or the server may not read
-it</td>
+<td>the resolved path, or its existing part, is outside the root, or the
+server may not read it</td>
 </tr>
 <tr>
 <td>6</td>
 <td>404</td>
-<td>the resolved path has a component starting with a dot, or is not a
-regular file</td>
+<td>a missing or unresolvable path (a file plus <code>/</code>
+included), a resolved dot component, or not a regular file</td>
 </tr>
 <tr>
 <td>7</td>
@@ -276,9 +277,9 @@ trusted, are: HEADERS on stream 0 or with an ID not higher than the
 last; DATA with no request open or on a different stream; or a new
 HEADERS before the open request&#39;s END_STREAM. After answering requests
 completed before the bad frame, the server sends the connection-error
-message on stream 0 (HEADERS with <code>:status</code> 400, then DATA
-holding the reason, the last with END_STREAM) and closes. If a frame is
-cut off by EOF, the server just closes.</p>
+message on stream 0, an ordinary 400 response (§4, §5) whose body is the
+reason, and closes. On EOF inside a frame or an unfinished request, the
+server just closes.</p>
 <h2 id="client">7. Client</h2>
 <p>The client matches responses to requests in order. A HEADERS frame on
 stream 0, at any point, starts a connection-error message; the client
@@ -287,19 +288,19 @@ errors, after which the client closes the connection: a HEADERS or DATA
 frame for any stream other than the oldest unanswered request; DATA
 before HEADERS or after END_STREAM; a second HEADERS in one response;
 DATA in a response to HEAD; a malformed or oversized response header
-block; a <code>content-length</code> mismatch; a frame cut off by EOF;
-and a read timeout.</p>
+block; a <code>content-length</code> mismatch; EOF while a response is
+unfinished; and a read timeout.</p>
 <h2 id="design-notes">8. Design notes</h2>
 <p>HTTP/2&#39;s header is Length 24, Type 8, Flags 8, then a reserved bit
 and a 31-bit Stream ID: 9 bytes. Its drafts used 8 bytes (a 16-bit
 Length in draft 04, 14 bits plus two reserved bits in draft 13) until
-draft 14 (2014) widened Length to 24 bits so a receiver can opt in to
-larger frames for bulk transfer; the default stays 2^14 so one big frame
-cannot delay the others. Flags are defined per frame type, so 8 bits are
-enough. The 31-bit Stream ID is a 32-bit word minus a reserved bit with
-no meaning (RFC 9113 §4.1); both ends start streams (client odd, server
-even), giving the client 2^30 IDs and the server 2^30 − 1. BHTTP/1 uses
-24 / 8 / 8 / 24 (8 bytes):</p>
+draft 14 (2014) widened Length to 24 bits, letting a receiver opt in to
+larger frames. The 2^14 default stops one big frame delaying the others.
+Flags are defined per frame type, so 8 bits are enough. The 31-bit
+Stream ID is a 32-bit word minus a reserved bit with no meaning (RFC
+9113 §4.1); both ends start streams (client odd, server even), giving
+the client 2^30 IDs and the server 2^30 − 1. BHTTP/1 uses 24 / 8 / 8 /
+24:</p>
 <ul>
 <li>Length 24. v1&#39;s sizes (16 KiB DATA recommended, header blocks at
 most 64 KiB − 1) fit in 16 bits; the extra byte allows larger frames now
@@ -323,9 +324,9 @@ integers) BHTTP/1 takes two ideas: names from a fixed table (HPACK&#39;s
 names only, since most values here (paths, dates, lengths) change on
 every message.</p>
 <p>With no preface, a misdirected HTTP/1.1 <code>GET /</code> reads as
-an unknown frame of Length 0x474554 and is skipped until the idle limit;
-v1 accepts that rather than add a preface to every connection. To grow,
-a v2 client first sends a new frame type, which a v2 server acknowledges
-before its first response and a v1 server skips.</p>
+an unknown frame of Length 0x474554 and is skipped until the idle limit,
+a slow failure v1 accepts. To grow, a v2 client first sends a new frame
+type, which a v2 server acknowledges before its first response and a v1
+server skips.</p>
 </body>
 </html>

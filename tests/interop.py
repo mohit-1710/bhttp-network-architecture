@@ -422,9 +422,18 @@ def test_root_and_timeouts():
             check("dotfile -> 404", recv_response(s, 4)[0] == 404)
             request(s, 5, "/env-link")
             check("symlink to a dotfile -> 404", recv_response(s, 5)[0] == 404)
-            request(s, 6, "/pipe")
+            os.symlink(tmp, os.path.join(root, "up"))                 # a directory outside
+            os.symlink(os.path.join(tmp, "gone.txt"), os.path.join(root, "dangling"))
+            request(s, 10, "/up/no-such-file.txt")
+            check("missing file behind a symlink that leaves the root -> 403, not 404",
+                  recv_response(s, 10)[0] == 403)
+            request(s, 11, "/dangling")
+            check("dangling symlink pointing outside the root -> 403", recv_response(s, 11)[0] == 403)
+            request(s, 12, "/up")
+            check("symlink to a directory outside the root -> 403", recv_response(s, 12)[0] == 403)
+            request(s, 13, "/pipe")
             s.settimeout(3)
-            check("FIFO in the root -> 404 at once, not a hang", recv_response(s, 6)[0] == 404)
+            check("FIFO in the root -> 404 at once, not a hang", recv_response(s, 13)[0] == 404)
             s.settimeout(None)
             s.close()
 
@@ -437,6 +446,21 @@ def test_root_and_timeouts():
             for c in held:
                 c.close()
             time.sleep(0.5)
+
+            # Closing connections frees their slots: 5 rounds of 16 open/use/close.
+            refused = 0
+            for _ in range(5):
+                conns = [connect(port) for _ in range(16)]
+                for c in conns:
+                    try:
+                        request(c, 1, "/ok.txt")
+                        recv_response(c, 1)
+                    except (OSError, EOFError):
+                        refused += 1
+                for c in conns:
+                    c.close()
+            check("a client that closes its connections is not refused at the cap", refused == 0,
+                  f"refused={refused}")
 
             # A client that reads too slowly is dropped instead of holding a process.
             # (It only sees EOF after draining what the kernel already buffered,
