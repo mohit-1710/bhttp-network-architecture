@@ -436,6 +436,16 @@ def test_root_and_timeouts():
             request(s, 130, "/pipe")
             s.settimeout(3)
             check("FIFO in the root -> 404 at once, not a hang", recv_response(s, 130)[0] == 404)
+            os.makedirs(os.path.join(root, "weird", "index.html"))
+            open(os.path.join(root, "weird", "index.html", "index.html"), "w").write("inner\n")
+            request(s, 131, "/weird/")
+            check("index.html that is a directory -> 404", recv_response(s, 131)[0] == 404)
+            os.mkdir(os.path.join(root, "locked"))
+            os.chmod(os.path.join(root, "locked"), 0)
+            request(s, 132, "/locked/nothere")
+            st_locked = recv_response(s, 132)[0]
+            os.chmod(os.path.join(root, "locked"), 0o755)
+            check("missing file under an unsearchable directory -> 404", os.geteuid() == 0 or st_locked == 404)
             os.symlink("loop-b", os.path.join(root, "loop-a"))
             os.symlink("loop-a", os.path.join(root, "loop-b"))
             request(s, 140, "/loop-a")
@@ -651,6 +661,9 @@ def test_client():
                         frame(DATA, END_STREAM, 0, b"400 Bad Request\nyour second request was odd\n")),
         "/bigreason": raw(lambda sid: frame(HEADERS, 0, 0, enc_headers([(":status", "400")])) +
                           frame(DATA, END_STREAM, 0, b"start of a long reason " + b"x" * 5000)),
+        "/head400": raw(lambda sid: frame(HEADERS, 0, sid, enc_headers([(":status", "400"),
+                                                                        ("content-length", "4")])) +
+                        frame(DATA, END_STREAM, sid, b"bad\n")),
         "/early": raw(lambda sid: frame(HEADERS, END_STREAM, sid, enc_headers([(":status", "103")]))),
         "*": resp(404, b"nope\n"),
     })
@@ -760,6 +773,9 @@ def test_client():
 
         r = bcurl("user@127.0.0.1:19101/x")
         check("user@host is a usage error", r.returncode == 1)
+
+        r = bcurl("-I", f"{base}/head400")
+        check("a 400 with a body is accepted even for HEAD -> exit 4", r.returncode == 4)
 
         r = bcurl("-t", "5x", f"{base}/ok")
         check("-t must be a whole number of seconds", r.returncode == 1)

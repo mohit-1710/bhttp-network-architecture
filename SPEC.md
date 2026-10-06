@@ -9,7 +9,7 @@ MUST, MUST NOT, SHOULD, RECOMMENDED and MAY are as in RFC 2119 and 8174. Integer
 
 BHTTP/1 runs over one TCP connection (default port 9000). The server answers requests in order on the connection they came in on. A client sends all the requests of one run on one connection and MUST NOT open a second. If it closes early, the client reports an error rather than reconnecting. A client SHOULD wait for each response before sending the next request.
 
-A server MUST also accept pipelined requests. It reads each request completely before answering it. A server MAY refuse a connection by closing it at once; otherwise it closes only after a connection error (§6), after a body it cannot finish (§4), when a request takes too long to arrive or the client stops taking response frames, or when no request has been in progress for a while (unknown frames do not count as activity); each such limit SHOULD be at least 10 s. Unless a body fails or the client stops taking frames, it never closes with a fully received request unanswered, so a request with no response was not processed.
+A server MUST also accept pipelined requests. It reads each request completely before answering it. A server MAY refuse a connection by closing it at once; otherwise it closes only after a connection error (§6), after a body it cannot finish (§4), when a request takes too long to arrive or the client stops taking response frames, or when no request has been in progress for a while (unknown frames do not count as activity); each limit, which may cover a whole frame or request, SHOULD be at least 10 s. Unless a body fails or the client stops taking frames, it never closes with a fully received request unanswered, so a request with no response was not processed.
 
 ## 2. Frame header
 
@@ -26,7 +26,7 @@ Every frame is an 8-byte header followed by Length bytes of payload.
 * Length: payload size, not counting the header (0 to 16 777 215).
 * Type: `0x00` DATA, `0x01` HEADERS. Any other value is an unknown type (§3).
 * Flags: `0x01` END_STREAM marks the last frame of a request or response. Senders MUST set the other bits to 0 and receivers MUST ignore them.
-* Stream ID: the client numbers its requests on a connection, starting at 1. Each request MUST use a higher ID than the one before (gaps are allowed), and the response carries the same ID. Stream 0 stands for the connection itself: in v1 it carries only unknown frames and the connection-error message of §6. IDs above 16 777 215 are never used; a client with more requests reports an error.
+* Stream ID: the client numbers its requests on a connection, usually from 1. Each request MUST use a higher ID than the one before (gaps are allowed), and the response carries the same ID. Stream 0 stands for the connection itself: in v1 it carries only unknown frames and the connection-error message of §6. IDs above 16 777 215 are never used; a client with more requests reports an error.
 
 ## 3. Unknown frame types
 
@@ -34,7 +34,7 @@ A receiver that reads a frame of unknown type MUST skip it: read and discard exa
 
 ## 4. Messages
 
-A request is one HEADERS frame and then zero or more DATA frames on the same stream, with END_STREAM on the last frame. A response has the same shape. A message with no body is a single HEADERS frame with END_STREAM set. The header block MUST fit in one HEADERS frame of at most 65 535 bytes, and a receiver MUST accept any such block, however many fields it holds. Senders SHOULD keep DATA frames to 16 384 bytes or less; receivers MUST accept any Length. A body ends at END_STREAM. A response to HEAD is always a single HEADERS frame with END_STREAM. Any other response with `content-length` MUST carry exactly that many DATA bytes; a difference is a protocol error. A request's `content-length` MUST be well-formed (§5) and is otherwise ignored. A sender that cannot finish a body MUST close the connection without END_STREAM, so the client can tell the body is incomplete.
+A request is one HEADERS frame and then zero or more DATA frames on the same stream, with END_STREAM on the last frame. A response has the same shape. A message with no body is a single HEADERS frame with END_STREAM set. The header block MUST fit in one HEADERS frame of at most 65 535 bytes, and a receiver MUST accept any such block, however many fields it holds. Senders SHOULD keep DATA frames to 16 384 bytes or less; receivers MUST accept any Length. A body ends at END_STREAM. A response to HEAD has no DATA, except a 400, as a server that cannot decode a block cannot know the method. Any other response with `content-length` MUST carry exactly that many DATA bytes; a difference is a protocol error. A request's `content-length` MUST be well-formed (§5) and is otherwise ignored. A sender that cannot finish a body MUST close the connection without END_STREAM, so the client can tell the body is incomplete.
 
 ## 5. Header block
 
@@ -55,11 +55,11 @@ Tag 0 means the name follows as a literal. Tags 1 to 10 name the fields of a pla
 | 2 | `:path` | 4 | `host` | 6 | `accept` | 8 | `date` | 10 | `content-length` |
 
 * Literal names are 1 to 32 767 lowercase HTTP token characters (RFC 9110 §5.6.2), so pseudo-headers (names starting with `:`) can only be sent by tag. Senders MUST use the tag for a table name; receivers MUST accept non-pseudo table names as literals too.
-* Values are 0 to 32 767 bytes and may hold any byte except NUL, CR and LF. `content-length` is 1 to 18 ASCII digits. `date` SHOULD use the HTTP date format (RFC 9110 §5.6.7) and is not checked. Senders SHOULD use the shortest `len`; receivers accept both.
+* Values are 0 to 32 767 bytes and may hold any byte except NUL, CR and LF. `content-length` is 1 to 18 ASCII digits, compared as a number. `date` SHOULD use the HTTP date format (RFC 9110 §5.6.7) and is not checked. Senders SHOULD use the shortest `len`; receivers accept both.
 * Pseudo-headers come before all other fields. `:method`, `:path`, `:status`, `host` and `content-length` appear at most once each, counted by name whether sent by tag or literal; other names may repeat.
 * A request has one `:method` (a case-sensitive HTTP token) and one `:path` (starting with `/`, at most 1024 bytes as sent), no `:status`, and SHOULD have `host`.
 * A response has one `:status`, three ASCII digits from 200 to 599, and no `:method` or `:path`. v1 has no 1xx responses.
-* A block is malformed if it breaks a rule here (bar SHOULDs and sender rules), uses tags 11 to 255, or overruns the payload.
+* A block is malformed if it breaks a rule here (other than SHOULDs and the duty to use tags), uses tags 11 to 255, or overruns the payload.
 
 ## 6. Server
 
@@ -76,11 +76,11 @@ The server cuts `:path` at the first `?` or `#` and decodes `%XX` escapes (`%2F`
 | 7 | 403 | the server may not read the file |
 | 8 | 500 | the file cannot be opened or read for any other reason |
 
-These are stream errors: the response goes on the request's stream (after any request body is read and discarded) and the connection stays open. Connection errors, where the frame sequence can no longer be trusted, are: HEADERS on stream 0 or with an ID not higher than every earlier HEADERS on the connection (answered or not); DATA with no request open or on a different stream; or a new HEADERS before the open request's END_STREAM. After answering requests completed before the bad frame, the server sends the connection-error message on stream 0, an ordinary 400 response (§4, §5) whose body is the reason, and closes. On EOF inside a frame or an unfinished request, the server just closes.
+These are stream errors: the response goes on the request's stream (after any request body is read and discarded) and the connection stays open. Connection errors, which win over stream errors in the same frame, are: HEADERS on stream 0 or with an ID not higher than every earlier HEADERS on the connection (answered or not); DATA with no request open or on a different stream; or a new HEADERS before the open request's END_STREAM. After answering requests completed before the bad frame, the server sends the connection-error message on stream 0, an ordinary 400 response (§4, §5) whose body is the reason, and closes. On EOF inside a frame or an unfinished request, the server just closes.
 
 ## 7. Client
 
-The client matches responses to requests in order. A HEADERS frame on stream 0, at any point, starts a connection-error message; the client reads it and its DATA, reports the reason and stops. These are protocol errors, after which the client closes the connection: a HEADERS or DATA frame for any stream other than the oldest unanswered request; DATA before HEADERS or after END_STREAM; a second HEADERS in one response; a HEAD response that is not a single HEADERS frame with END_STREAM; a malformed or oversized response block; a `content-length` mismatch; EOF mid-response; and a read timeout.
+The client matches responses to requests in order. A HEADERS frame on stream 0, at any point, starts a connection-error message; the client reads it and its DATA, reports the reason and stops. These are protocol errors, after which the client closes the connection: a HEADERS or DATA frame for any stream other than the oldest unanswered request; DATA before HEADERS or after END_STREAM; a second HEADERS in one response; DATA in a response to HEAD other than a 400; a malformed or oversized response block; a `content-length` mismatch; EOF mid-response; and a read timeout.
 
 ## 8. Design notes
 

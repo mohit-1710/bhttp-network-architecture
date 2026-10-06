@@ -253,7 +253,7 @@ static int resolve_path(const char *dec, char *out)
     snprintf(full, sizeof full, "%s%s%s", g_root, dec,
              dl && dec[dl - 1] == '/' ? "index.html" : "");
     struct stat st;
-    if (stat(full, &st) == 0 && S_ISDIR(st.st_mode)) {
+    if (!(dl && dec[dl - 1] == '/') && stat(full, &st) == 0 && S_ISDIR(st.st_mode)) {
         size_t fl = strlen(full);
         if (fl + sizeof "/index.html" > sizeof full)
             return 404;
@@ -261,11 +261,8 @@ static int resolve_path(const char *dec, char *out)
     }
 
     char real[PATH_MAX];
-    if (!realpath(full, real)) {
-        if (errno == EACCES)
-            return 403;
+    if (!realpath(full, real))          /* missing or unresolvable, EACCES included */
         return leads_outside(full) ? 403 : 404;
-    }
     /* Symlinks must not lead outside the root. */
     if (!inside_root(real))
         return 403;
@@ -328,14 +325,15 @@ static int handle_request(int fd, uint32_t sid, const uint8_t *block, size_t len
         int e = ffd < 0 ? errno : ENOENT;
         if (ffd >= 0)
             close(ffd);
-        rc = send_error(fd, sid, e == EACCES ? 403 : e == ENOENT || e == ENOTDIR ? 404 : 500,
-                        path, head);
+        rc = send_error(fd, sid, e == EACCES ? 403 :
+                        e == ENOENT || e == ENOTDIR || e == ELOOP ? 404 : 500, path, head);
         goto out;
     }
 
     long long remaining = st.st_size;
     rc = send_response_headers(fd, sid, 200, mime_type(file), remaining, head || remaining == 0);
-    logf_("stream=%u %s %s -> 200 (%lld bytes)", sid, method, path, (long long)st.st_size);
+    if (rc == 0)
+        logf_("stream=%u %s %s -> 200 (%lld bytes)", sid, method, path, (long long)st.st_size);
     if (rc == 0 && !head) {
         uint8_t chunk[BH_DATA_CHUNK];
         while (remaining > 0) {
@@ -607,13 +605,14 @@ int main(int argc, char **argv)
         struct sockaddr_storage ss;
         socklen_t sl = sizeof ss;
         int cfd = accept(lfd, (struct sockaddr *)&ss, &sl);
+        int accept_errno = errno;       /* waitpid below would overwrite it */
         pid_t done;
         while ((done = waitpid(-1, NULL, WNOHANG)) > 0)   /* also after SIGCHLD's EINTR */
             forget_child(done);
         if (cfd < 0) {
-            if (errno != EINTR)
-                perror("bserve: accept");
-            if (errno == EMFILE || errno == ENFILE)
+            if (accept_errno != EINTR)
+                fprintf(stderr, "bserve: accept: %s\n", strerror(accept_errno));
+            if (accept_errno == EMFILE || accept_errno == ENFILE)
                 usleep(100000);     /* out of descriptors: back off, don't spin */
             continue;
         }

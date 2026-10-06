@@ -8,7 +8,7 @@ Captured from `./bcurl` against `./bserve ./www 9000`. The request asks for `/he
 
 On the wire there are three frames and 189 bytes: a 74-byte request and a 115-byte response.
 
-Table offsets are payload offsets, as in the `-v` output: offset 0x00 is byte 8 of the frame.
+Table offsets are payload offsets, as in the `-v` output: offset 0x00 is the frame's ninth byte (index 8).
 
 ## Request, client to server (one frame, 8 + 66 bytes)
 
@@ -27,7 +27,7 @@ Frame header:
 |---|---|---|
 | `00 00 42` | Length | 0x42 = 66 payload bytes follow |
 | `01` | Type | HEADERS |
-| `01` | Flags | END_STREAM, so no DATA follows (a GET has no body) |
+| `01` | Flags | END_STREAM, so no DATA follows (this GET has no body) |
 | `00 00 01` | Stream ID | 1, the first request on this connection |
 
 Header block. Each field is a tag byte, then a literal name only when the tag is 0, then a length-prefixed value:

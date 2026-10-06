@@ -372,7 +372,9 @@ static int read_response(int fd, uint32_t sid, int head, int show_headers)
 
     long long got = 0;
     int end = f.flags & BH_FLAG_END_STREAM;
-    if (head && !end) {
+    /* A 400 may carry a body even for HEAD: the server may not have been
+     * able to read the method (SPEC §4). */
+    if (head && !end && status != 400) {
         fprintf(stderr, "bcurl: response to HEAD does not end with its HEADERS frame\n");
         return -1;
     }
@@ -429,7 +431,7 @@ static int read_response(int fd, uint32_t sid, int head, int show_headers)
         return -1;
     }
     /* A HEAD response describes the body it did not send. */
-    if (!head && want >= 0 && got != want) {
+    if ((!head || status == 400) && want >= 0 && got != want) {
         fprintf(stderr, "bcurl: body is %lld bytes but content-length said %lld\n", got, want);
         return -1;
     }

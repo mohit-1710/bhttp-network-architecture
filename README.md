@@ -111,7 +111,7 @@ flowchart TB
 
 A real request for `/hello.txt` starts with the header `00 00 31 01 01 00 00 01`: Length 49, HEADERS, END_STREAM, stream 1. The 49-byte header block follows.
 
-Ten common names (`:method`, `:path`, `:status`, `host`, `user-agent`, `accept`, `server`, `date`, `content-type`, `content-length`) are sent as one-byte tags; other names, and all values, are length-prefixed. The encoding is in SPEC §5.
+Ten names have one-byte tags (table in SPEC §5); everything else is length-prefixed.
 
 ---
 
@@ -123,7 +123,7 @@ Ten common names (`:method`, `:path`, `:status`, `host`, `user-agent`, `accept`,
 | Client (Track 2) | `bcurl -v localhost:9000/index.html` builds the request frame, writes the body to stdout, hexdumps every frame with `-v`, exits non-zero on 4xx and 5xx, and sends any extra paths on the same connection. |
 | Unknown frames | Both sides skip frame types they do not know, on any stream and between any two frames. `--grease` sends a type `0xFA` frame first, to check that the server skips it. |
 | Path safety | `..` gives 403. Dotfiles, FIFOs and other non-regular files give 404, even through a symlink. Symlinks must resolve inside the root, and a missing file behind an outside link is 403, not 404. |
-| Timeouts and caps | Idle and request deadlines, a per-frame deadline in each direction (see Run), 128 connections in all and 32 per client address. |
+| Timeouts and caps | bserve drops a connection that sits idle, sends a request too slowly or reads a frame too slowly for longer than `-t` (default 30 s). It serves 128 connections at once, 32 per client address. |
 | Truncated bodies | If a file read fails mid-body the server drops the connection instead of sending END_STREAM, and the client checks `content-length` against the bytes received. |
 
 ---
@@ -138,9 +138,9 @@ Ten common names (`:method`, `:path`, `:status`, `host`, `user-agent`, `accept`,
 | Header names | 10-entry static table + literals | HPACK's dynamic table and Huffman coding: the Huffman code table alone has 257 entries, for a few bytes saved on a 57-byte request |
 | String lengths | 1 byte below 128, else 2 bytes with the top bit set | fixed 2-byte lengths (a byte wasted on almost every field); HPACK prefix integers |
 | End of body | END_STREAM, checked against `content-length` | either alone: without END_STREAM a sender cannot stream a body of unknown size, and without the length check a cut-off body looks complete |
-| Version 2 | new frame types, negotiated by a frame v1 skips | a version byte in every header; a connection preface |
+| Version 2 | new frame types, negotiated by a frame v1 skips | a version byte in every header (a byte per frame that v1 never uses); a connection preface (extra bytes on every connection, and v1 peers could not tell one from a stray request) |
 
-SPEC §8 has the longer argument, including why HTTP/2's own drafts used 8 bytes.
+SPEC §8 has the longer argument, including HTTP/2's own 8-byte drafts.
 
 ---
 
@@ -154,7 +154,7 @@ Apple M5 Pro, loopback, release build (`make`); times are the middle of three ru
 | 10 000 requests over one connection, one at a time | 0.52 s, 19 000 requests/s (52 µs each) |
 | 200 MB file, 12 208 DATA frames | 0.095 s, 2.1 GB/s, byte-identical |
 | Framing overhead on a full DATA frame | 8 / 16 392 bytes = 0.05 % |
-| Tests (C programs against a separate Python implementation) | 111 passing on Ubuntu and macOS, and again under ASan and UBSan ([CI](.github/workflows/ci.yml)) |
+| Tests (C programs against a separate Python implementation) | 114 passing on Ubuntu and macOS, and again under ASan and UBSan ([CI](.github/workflows/ci.yml)) |
 | Header-block fuzzing (`make fuzz`, under ASan and UBSan) | 300 000 mutated blocks, no crashes |
 
 ---
@@ -205,7 +205,7 @@ bserve's stderr is kept during the run, and the last check fails if it contains 
 
 ```
 SPEC.md                 the protocol (docs/SPEC.pdf: the same text on two pages; docs/build.sh rebuilds it)
-HEXDUMP.md              a GET annotated byte by byte, plus a 404, a skipped frame and a 400
+HEXDUMP.md              annotated captures: GET, 404, skipped frame, 400
 src/bproto.[ch]         frame header, header-block codec, deadlines, -v hexdump
 src/bserve.c            Track 1, the server
 src/bcurl.c             Track 2, the client
