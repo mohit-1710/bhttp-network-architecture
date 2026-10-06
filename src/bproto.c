@@ -49,8 +49,9 @@ void bh_unpack_header(const uint8_t i[BH_FRAME_HEADER_LEN], bh_frame *f)
 /* ---- I/O ------------------------------------------------------------ */
 
 static long long g_deadline_ms;     /* monotonic ms; 0 = none */
+static int g_frame_timeout;         /* s one bh_send_frame may take; 0 = none */
 
-static long long now_ms(void)
+long long bh_now_ms(void)
 {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
@@ -59,7 +60,12 @@ static long long now_ms(void)
 
 void bh_set_deadline(int seconds)
 {
-    g_deadline_ms = seconds > 0 ? now_ms() + (long long)seconds * 1000 : 0;
+    g_deadline_ms = seconds > 0 ? bh_now_ms() + (long long)seconds * 1000 : 0;
+}
+
+void bh_set_frame_timeout(int seconds)
+{
+    g_frame_timeout = seconds;
 }
 
 /* Wait until fd is readable or the deadline passes. A slow sender cannot
@@ -69,7 +75,7 @@ static int wait_readable(int fd)
     if (!g_deadline_ms)
         return 0;
     for (;;) {
-        long long left = g_deadline_ms - now_ms();
+        long long left = g_deadline_ms - bh_now_ms();
         if (left <= 0) {
             errno = ETIMEDOUT;
             return -1;
@@ -138,11 +144,21 @@ int bh_send_frame(int fd, uint8_t type, uint8_t flags, uint32_t stream,
     };
     int cnt = len ? 2 : 1;
     struct iovec *v = iov;
+    long long deadline = g_frame_timeout ? bh_now_ms() + g_frame_timeout * 1000LL : 0;
     while (cnt > 0) {
         ssize_t w = writev(fd, v, cnt);
         if (w < 0) {
-            if (errno == EINTR)
+            /* EAGAIN here means SO_SNDTIMEO passed with nothing written. */
+            if (errno == EINTR ||
+                ((errno == EAGAIN || errno == EWOULDBLOCK) && deadline && bh_now_ms() < deadline))
                 continue;
+            if (errno == EAGAIN || errno == EWOULDBLOCK)
+                errno = ETIMEDOUT;      /* peer is reading too slowly */
+            return -1;
+        }
+        if (deadline && cnt > 0 && bh_now_ms() >= deadline &&
+            (size_t)w < v[0].iov_len + (cnt > 1 ? v[1].iov_len : 0)) {
+            errno = ETIMEDOUT;          /* peer is reading too slowly */
             return -1;
         }
         while (cnt > 0 && (size_t)w >= v->iov_len) {
@@ -277,13 +293,18 @@ static int get_len(const uint8_t *p, size_t len, size_t *pos, size_t *out)
     return 0;
 }
 
+/* Literal names: HTTP token characters (RFC 9110 §5.6.2), lowercase only.
+ * ':' is not a token character, so pseudo-headers can only use the table. */
 static int name_ok(const uint8_t *s, size_t n)
 {
-    if (n == 0 || s[0] == ':')          /* pseudo-headers only via the table */
+    if (n == 0)
         return 0;
-    for (size_t i = 0; i < n; i++)
-        if (s[i] <= 0x20 || s[i] >= 0x7F || (s[i] >= 'A' && s[i] <= 'Z'))
+    for (size_t i = 0; i < n; i++) {
+        uint8_t c = s[i];
+        if (!((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || strchr("!#$%&'*+-.^_`|~", c)) ||
+            c == 0)
             return 0;
+    }
     return 1;
 }
 
@@ -351,6 +372,11 @@ int bh_hb_decode(const uint8_t *p, size_t len, bh_headers *h)
         pos += n;
         h->n++;
     }
+    /* Fields that must not repeat. */
+    static const char *const once[] = { ":method", ":path", ":status", "host", "content-length" };
+    for (size_t i = 0; i < sizeof once / sizeof once[0]; i++)
+        if (bh_count(h, once[i]) > 1)
+            goto bad;
     return 0;
 bad:
     bh_headers_free(h);

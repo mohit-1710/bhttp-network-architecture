@@ -8,20 +8,23 @@
  * hexdumps every frame (sent '>' and received '<') to stderr. Extra paths are
  * fetched one after another over the same connection.
  *
- * Exit status: 0 all responses 1xx-3xx, 1 usage, 2 cannot connect,
+ * Exit status: 0 all responses below 400, 1 usage, 2 cannot connect,
  *              3 protocol, timeout or output error, 4 a 4xx, 5 a 5xx response.
  */
 #include "bproto.h"
 
 #include <ctype.h>
+#include <errno.h>
 #include <fcntl.h>
 #include <netdb.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
+#include <poll.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <sys/socket.h>
 #include <sys/time.h>
 #include <unistd.h>
@@ -33,7 +36,7 @@
 enum { EX_OK = 0, EX_USAGE = 1, EX_CONNECT = 2, EX_PROTO = 3, EX_4XX = 4, EX_5XX = 5 };
 
 static FILE *g_trace;
-static int   g_timeout = 30;        /* -t: s without any bytes from the server */
+static int   g_timeout = 30;        /* -t: s to connect, and s without any bytes */
 
 static void usage(void)
 {
@@ -43,19 +46,21 @@ static void usage(void)
     exit(EX_USAGE);
 }
 
-typedef struct { char host[256]; char port[8]; char path[4096]; } target;
+typedef struct { char host[256]; char port[8]; char path[BH_MAX_PATH + 2]; } target;
 
-/* Parse [bhttp://]host[:port][/path], with [v6]:port allowed. */
+/* Parse [bhttp://]host[:port][/path][?query], with [v6]:port allowed. */
 static int parse_url(const char *url, target *t)
 {
-    const char *scheme = strstr(url, "://");
-    if (scheme) {
-        if (strncmp(url, "bhttp://", 8) != 0)
+    /* A scheme is letters followed by "://" at the very start. */
+    size_t sl = 0;
+    while (isalpha((unsigned char)url[sl]))
+        sl++;
+    if (sl > 0 && strncmp(url + sl, "://", 3) == 0) {
+        if (sl != 5 || strncasecmp(url, "bhttp", 5) != 0)
             return -1;              /* http://, https:// ... are not BHTTP */
-        url += 8;
+        url += sl + 3;
     }
-    const char *slash = strchr(url, '/');
-    size_t alen = slash ? (size_t)(slash - url) : strlen(url);
+    size_t alen = strcspn(url, "/?#");
     char auth[300];
     if (alen == 0 || alen >= sizeof auth)
         return -1;
@@ -79,22 +84,38 @@ static int parse_url(const char *url, target *t)
     if (!*host || strlen(host) >= sizeof t->host)
         return -1;
     strcpy(t->host, host);
-    if (port && !*port)
-        return -1;                  /* "host:" with no port */
     if (port) {
-        char *end;
-        long p = strtol(port, &end, 10);
-        if (*end || p < 1 || p > 65535)
+        if (!*port || strlen(port) > 5 || strspn(port, "0123456789") != strlen(port) ||
+            atoi(port) < 1 || atoi(port) > 65535)
             return -1;
-        snprintf(t->port, sizeof t->port, "%ld", p);
+        snprintf(t->port, sizeof t->port, "%d", atoi(port));
     } else {
         strcpy(t->port, DEFAULT_PORT);
     }
-    const char *path = slash ? slash : "/";
-    if (strlen(path) > BH_MAX_PATH)
+    /* "host?x" means "/?x". */
+    const char *rest = url + alen;
+    if (strlen(rest) + 1 > BH_MAX_PATH)
         return -1;
-    strcpy(t->path, path);
-    return 0;
+    snprintf(t->path, sizeof t->path, "%s%s", *rest == '/' ? "" : "/", rest);
+    return bh_valid_value(t->path) ? 0 : -1;
+}
+
+/* Connect with a timeout: a non-blocking connect, then poll. */
+static int connect_with_timeout(int fd, const struct sockaddr *sa, socklen_t len)
+{
+    int fl = fcntl(fd, F_GETFL);
+    fcntl(fd, F_SETFL, fl | O_NONBLOCK);
+    int rc = connect(fd, sa, len);
+    if (rc != 0 && errno == EINPROGRESS) {
+        struct pollfd p = { fd, POLLOUT, 0 };
+        int err = 0;
+        socklen_t el = sizeof err;
+        if (poll(&p, 1, g_timeout * 1000) == 1 &&
+            getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &el) == 0 && err == 0)
+            rc = 0;
+    }
+    fcntl(fd, F_SETFL, fl);
+    return rc;
 }
 
 static int connect_to(const target *t)
@@ -108,12 +129,12 @@ static int connect_to(const target *t)
         return -1;
     }
     int fd = -1;
-    /* Try each address until one connects; exactly one connection survives. */
+    /* Try each address in turn; close the failures, keep the first that connects. */
     for (ai = res; ai; ai = ai->ai_next) {
         fd = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
         if (fd < 0)
             continue;
-        if (connect(fd, ai->ai_addr, ai->ai_addrlen) == 0)
+        if (connect_with_timeout(fd, ai->ai_addr, ai->ai_addrlen) == 0)
             break;
         close(fd);
         fd = -1;
@@ -157,36 +178,35 @@ static void add_header(options *o, const char *arg)
     while (*val == ' ')
         val++;
     if (!colon || !bh_valid_name(name) || !bh_valid_value(val)) {
-        fprintf(stderr, "bcurl: bad header '%s' (want 'name: value', name in visible "
-                        "ASCII without ':' or spaces, value under 32768 bytes)\n", arg);
+        fprintf(stderr, "bcurl: bad header '%s' (want 'name: value', name made of HTTP "
+                        "token characters, value under 32768 bytes without CR/LF)\n", arg);
         exit(EX_USAGE);
     }
     o->names[o->nextra] = name;
     o->values[o->nextra++] = val;
 }
 
-static int three_digits(const char *s)
+static int valid_method(const char *m)
 {
-    return s && s[0] >= '1' && s[0] <= '5' && s[1] >= '0' && s[1] <= '9' &&
+    size_t n = strlen(m);
+    if (n == 0 || n > 32)
+        return 0;
+    for (size_t i = 0; i < n; i++)
+        if (!isalpha((unsigned char)m[i]) && m[i] != '-' && m[i] != '_')
+            return 0;
+    return 1;
+}
+
+static int valid_status(const char *s)
+{
+    return s && s[0] >= '2' && s[0] <= '5' && s[1] >= '0' && s[1] <= '9' &&
            s[2] >= '0' && s[2] <= '9' && s[3] == '\0';
 }
 
-/* The server reported a connection error on stream 0: show it and give up. */
-static void report_connection_error(int fd, const bh_frame *f)
+static const char *closed_or_timed_out(void)
 {
-    int end = f->flags & BH_FLAG_END_STREAM;
-    bh_frame d;
-    fprintf(stderr, "bcurl: server reported a connection error");
-    while (!end && bh_next_frame(fd, &d, g_trace) == 0 && d.type == BH_DATA && d.stream == 0 &&
-           d.length <= 4096) {
-        char msg[4097], safe[4 * 4096 + 8];
-        if (bh_read_full(fd, msg, d.length) != 0)
-            break;
-        msg[d.length] = '\0';
-        fprintf(stderr, ": %s", bh_escape(msg, safe, sizeof safe));
-        end = d.flags & BH_FLAG_END_STREAM;
-    }
-    fputc('\n', stderr);
+    return errno == EAGAIN || errno == EWOULDBLOCK || errno == ETIMEDOUT ? "timed out"
+                                                                         : "closed";
 }
 
 static int send_request(int fd, uint32_t sid, const target *t, const options *o)
@@ -210,64 +230,104 @@ static int send_request(int fd, uint32_t sid, const target *t, const options *o)
     bh_hb_add(&b, "accept", "*/*");
     for (int i = 0; i < o->nextra; i++)
         bh_hb_add(&b, o->names[i], o->values[i]);
-    int rc = b.err ? -1
-                   : bh_send_frame(fd, BH_HEADERS, BH_FLAG_END_STREAM, sid, b.buf,
-                                   (uint32_t)b.len, g_trace);
+    int rc = -1;
+    if (b.err || b.len > BH_MAX_HEADER_BLOCK)
+        fprintf(stderr, "bcurl: request headers exceed %u bytes\n", BH_MAX_HEADER_BLOCK);
+    else
+        rc = bh_send_frame(fd, BH_HEADERS, BH_FLAG_END_STREAM, sid, b.buf, (uint32_t)b.len,
+                           g_trace);
     bh_buf_free(&b);
     return rc;
 }
 
-/* Read one response on stream sid. Returns the status code, or -1. */
-static int read_response(int fd, uint32_t sid)
+/* Read and decode a header block of f->length bytes (length already checked). */
+static int read_block(int fd, const bh_frame *f, bh_headers *h)
 {
-    bh_frame f;
-    int r = bh_next_frame(fd, &f, g_trace);
-    if (r != 0) {
-        fprintf(stderr, "bcurl: connection closed or timed out before a response arrived\n");
-        return -1;
-    }
-    if (f.type == BH_HEADERS && f.stream == 0 && f.length <= BH_MAX_HEADER_BLOCK) {
-        if (bh_read_payload(fd, &f, NULL, NULL) == 0)
-            report_connection_error(fd, &f);
-        return -1;
-    }
-    if (f.type != BH_HEADERS || f.stream != sid) {
-        fprintf(stderr, "bcurl: expected HEADERS on stream %u, got type 0x%02x on stream %u\n",
-                sid, f.type, f.stream);
-        return -1;
-    }
-    if (f.length > 1u << 20) {
-        fprintf(stderr, "bcurl: response header block too large (%u bytes)\n", f.length);
-        return -1;
-    }
-    uint8_t *block = malloc(f.length ? f.length : 1);
-    if (!block || bh_read_payload(fd, &f, block, g_trace) != 0) {
+    uint8_t *block = malloc(f->length ? f->length : 1);
+    if (!block || bh_read_payload(fd, f, block, g_trace) != 0) {
         free(block);
-        fprintf(stderr, "bcurl: truncated HEADERS frame\n");
+        fprintf(stderr, "bcurl: connection %s inside a HEADERS frame\n", closed_or_timed_out());
         return -1;
     }
     if (g_trace)
-        bh_trace_fields(g_trace, '<', block, f.length);
-
-    bh_headers h;
-    int status = -1;
-    if (bh_hb_decode(block, f.length, &h) == 0) {
-        const char *s = bh_get(&h, ":status");
-        if (three_digits(s) && bh_count(&h, ":status") == 1 && bh_count(&h, ":method") == 0 &&
-            bh_count(&h, ":path") == 0)
-            status = atoi(s);
-        bh_headers_free(&h);
-    }
+        bh_trace_fields(g_trace, '<', block, f->length);
+    int rc = bh_hb_decode(block, f->length, h);
     free(block);
-    if (status < 0) {
-        fprintf(stderr, "bcurl: response has a malformed header block or no valid :status\n");
+    if (rc != 0)
+        fprintf(stderr, "bcurl: malformed response header block\n");
+    return rc;
+}
+
+/* A HEADERS frame on stream 0 is the server reporting a connection error
+ * (SPEC §6). Print the reason from its body and give up. */
+static void report_connection_error(int fd, const bh_frame *f)
+{
+    bh_headers h;
+    if (read_block(fd, f, &h) == 0)
+        bh_headers_free(&h);
+    char msg[4097], safe[4 * 4096 + 8];
+    size_t used = 0;
+    int end = f->flags & BH_FLAG_END_STREAM;
+    bh_frame d;
+    while (!end && bh_next_frame(fd, &d, g_trace) == 0 && d.type == BH_DATA && d.stream == 0 &&
+           used + d.length < sizeof msg) {
+        if (bh_read_payload(fd, &d, (uint8_t *)msg + used, g_trace) != 0)
+            break;
+        used += d.length;
+        end = d.flags & BH_FLAG_END_STREAM;
+    }
+    msg[used] = '\0';
+    fprintf(stderr, "bcurl: server reported a connection error: %s\n",
+            bh_escape(msg, safe, sizeof safe));
+}
+
+/* Read one response on stream sid. Returns the status code, or -1. */
+static int read_response(int fd, uint32_t sid, int head)
+{
+    bh_frame f;
+    if (bh_next_frame(fd, &f, g_trace) != 0) {
+        fprintf(stderr, "bcurl: connection %s before a response arrived\n", closed_or_timed_out());
+        return -1;
+    }
+    if (f.type == BH_HEADERS && f.length > BH_MAX_HEADER_BLOCK) {
+        fprintf(stderr, "bcurl: response header block over %u bytes\n", BH_MAX_HEADER_BLOCK);
+        return -1;
+    }
+    if (f.type == BH_HEADERS && f.stream == 0) {
+        report_connection_error(fd, &f);
+        return -1;
+    }
+    if (f.type != BH_HEADERS || f.stream != sid) {
+        fprintf(stderr, "bcurl: expected HEADERS on stream %u, got %s on stream %u\n", sid,
+                f.type == BH_DATA ? "DATA" : "HEADERS", f.stream);
         return -1;
     }
 
+    bh_headers h;
+    if (read_block(fd, &f, &h) != 0)
+        return -1;
+    const char *s = bh_get(&h, ":status");
+    const char *cl = bh_get(&h, "content-length");
+    int status = -1;
+    long long want = -1;
+    if (valid_status(s) && !bh_get(&h, ":method") && !bh_get(&h, ":path"))
+        status = atoi(s);
+    if (cl && *cl && strspn(cl, "0123456789") == strlen(cl) && strlen(cl) < 19)
+        want = atoll(cl);
+    else if (cl)
+        status = -1;
+    bh_headers_free(&h);
+    if (status < 0) {
+        fprintf(stderr, "bcurl: response has no valid :status (200-599) or a bad content-length\n");
+        return -1;
+    }
+
+    long long got = 0;
     int end = f.flags & BH_FLAG_END_STREAM;
     while (!end) {
         if (bh_next_frame(fd, &f, g_trace) != 0) {
-            fprintf(stderr, "bcurl: connection closed mid-response\n");
+            fprintf(stderr, "bcurl: connection %s mid-response (body incomplete)\n",
+                    closed_or_timed_out());
             return -1;
         }
         if (f.type != BH_DATA || f.stream != sid) {
@@ -282,7 +342,8 @@ static int read_response(int fd, uint32_t sid)
             if (n > sizeof chunk)
                 n = sizeof chunk;
             if (bh_read_full(fd, chunk, n) != 0) {
-                fprintf(stderr, "bcurl: truncated DATA frame or read timeout\n");
+                fprintf(stderr, "bcurl: connection %s inside a DATA frame\n",
+                        closed_or_timed_out());
                 return -1;
             }
             if (g_trace)
@@ -293,10 +354,16 @@ static int read_response(int fd, uint32_t sid)
             }
             done += n;
         }
+        got += f.length;
         end = f.flags & BH_FLAG_END_STREAM;
     }
     if (fflush(stdout) != 0) {
         fprintf(stderr, "bcurl: writing to stdout failed\n");
+        return -1;
+    }
+    /* A HEAD response describes the body it did not send. */
+    if (!head && want >= 0 && got != want) {
+        fprintf(stderr, "bcurl: body is %lld bytes but content-length said %lld\n", got, want);
         return -1;
     }
     return status;
@@ -320,8 +387,8 @@ int main(int argc, char **argv)
             o.method = argv[++i];
         else if (strcmp(a, "-H") == 0 && i + 1 < argc)
             add_header(&o, argv[++i]);
-        else if (strcmp(a, "-t") == 0 && i + 1 < argc && (g_timeout = atoi(argv[i + 1])) > 0)
-            i++;
+        else if (strcmp(a, "-t") == 0 && i + 1 < argc && atoi(argv[i + 1]) > 0)
+            g_timeout = atoi(argv[++i]);
         else if (strcmp(a, "--grease") == 0)
             o.grease = 1;
         else if (a[0] == '-')
@@ -331,6 +398,10 @@ int main(int argc, char **argv)
     }
     if (nurls == 0)
         usage();
+    if (!valid_method(o.method)) {
+        fprintf(stderr, "bcurl: bad method (letters, '-' or '_', at most 32)\n");
+        return EX_USAGE;
+    }
 
     target base;
     if (parse_url(urls[0], &base) != 0) {
@@ -349,8 +420,8 @@ int main(int argc, char **argv)
     for (int i = 1; i < nurls; i++) {
         ts[i] = base;
         if (urls[i][0] == '/') {
-            if (strlen(urls[i]) > BH_MAX_PATH) {
-                fprintf(stderr, "bcurl: path longer than %u bytes\n", BH_MAX_PATH);
+            if (strlen(urls[i]) > BH_MAX_PATH || !bh_valid_value(urls[i])) {
+                fprintf(stderr, "bcurl: bad path '%s'\n", urls[i]);
                 return EX_USAGE;
             }
             strcpy(ts[i].path, urls[i]);
@@ -375,21 +446,26 @@ int main(int argc, char **argv)
     if (g_trace)
         fprintf(g_trace, "* connected to %s port %s (BHTTP/1)\n", base.host, base.port);
 
-    int rc = EX_OK;
+    int rc = EX_OK, head = strcmp(o.method, "HEAD") == 0;
     for (int i = 0; i < nurls; i++) {
         uint32_t sid = (uint32_t)i + 1;
         if (send_request(fd, sid, &ts[i], &o) != 0) {
-            fprintf(stderr, "bcurl: failed to send request\n");
+            fprintf(stderr, "bcurl: failed to send request %u\n", sid);
             rc = EX_PROTO;
             break;
         }
-        int status = read_response(fd, sid);
+        int status = read_response(fd, sid, head);
         if (status < 0) {
+            if (i + 1 < nurls)
+                fprintf(stderr, "bcurl: %d later request(s) not sent\n", nurls - i - 1);
             rc = EX_PROTO;
             break;
         }
-        if (g_trace)
-            fprintf(g_trace, "* stream %u: %s %s -> %d\n", sid, o.method, ts[i].path, status);
+        if (g_trace) {
+            char safe[4 * BH_MAX_PATH + 8];
+            fprintf(g_trace, "* stream %u: %s %s -> %d\n", sid, o.method,
+                    bh_escape(ts[i].path, safe, sizeof safe), status);
+        }
         if (status >= 500)
             rc = EX_5XX;
         else if (status >= 400 && rc != EX_5XX)

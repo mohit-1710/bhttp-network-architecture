@@ -8,7 +8,7 @@ This is one exchange between `./bcurl` and `./bserve ./www 9000`. The request as
 
 On the wire there are three frames and 189 bytes: a 74-byte request and a 115-byte response.
 
-Offsets in the tables count from the first payload byte, as in the `-v` output. Payload offset 0x00 is byte 8 of the frame. The unedited `-v` output is at the end of this file.
+Offsets in the tables count from the first payload byte, as in the `-v` output. Payload offset 0x00 is byte 8 of the frame. The unedited `-v` output of each capture is included.
 
 ## Request, client to server (one frame, 8 + 66 bytes)
 
@@ -89,27 +89,104 @@ payload  48 65 6c 6c 6f 2c 20 62  69 6e 61 72 79 20 48 54
 | `00` | Type | DATA |
 | `01` | Flags | END_STREAM: this is the last frame of the response |
 | `00 00 01` | Stream ID | 1 |
-| `48 65 … 21 0a` | payload | `Hello, binary HTTP!\n`, written to stdout as it is |
+| `48 65 … 21 0a` | payload | `Hello, binary HTTP!\n`, written to stdout unchanged |
 
 After END_STREAM the client could have sent stream 2 on the same socket. It had nothing else to fetch, so it closed the connection and exited with 0.
 
-## Two-byte lengths
+## A 404 with a two-byte length
 
-Every string above is shorter than 128 bytes, so each length took one byte with the top bit clear. A longer string sets the top bit and uses 15 bits across two bytes. For example, a 300-byte value (300 = 0x012c) is prefixed `81 2c`. The largest one-byte length is `7f` (127). The smallest two-byte one is `80 80` (128). `tests/interop.py` builds an exactly 64 KiB header block from values of up to 32 767 bytes (prefix `ff ff`).
+Every string above is shorter than 128 bytes, so each length took one byte with the top bit clear. Longer strings set the top bit and use 15 bits across two bytes: 127 is `7f`, 128 is `80 80`, 300 is `81 2c` and the largest, 32 767, is `ff ff`. Asking for a file that does not exist, with a 140-byte name, shows the two-byte form and an error response in one exchange:
+
+```
+./bcurl -v localhost:9000/notes/2026/network-architecture/week-6/interop-results-between-our-bserve-and-bcurl-and-the-independent-python-peer-in-the-tests-folder.txt
+```
+
+| where | bytes | decoded |
+|---|---|---|
+| request header | `00 00 b4 01 01 00 00 01` | Length 0xb4 = 180, HEADERS, END_STREAM, stream 1 |
+| payload 0x05 | `02` | tag 2 `:path` |
+| payload 0x06 | `80 8c` | top bit set, so two bytes: 0x008c = 140 |
+| payload 0x08 | `2f 6e 6f 74 65 73 …` | the 140-byte path, ending at 0x93 |
+| request total | | 5 + (1 + 2 + 140) + 16 + 11 + 5 = 180 = 0xb4 |
+| response HEADERS | `03 03 34 30 34` | `:status` `404`; Flags 0, so a body follows |
+| response HEADERS | `0a 03 31 35 35` | `content-length` `155` |
+| response DATA | `00 00 9b 00 01 00 00 01` | Length 0x9b = 155, END_STREAM: `404 Not Found\n` plus the path and a newline (14 + 140 + 1) |
+
+bcurl wrote the 155-byte body to stdout and exited with 4 because the status was 4xx. The connection was still usable: a second path on the same command line would have gone out as stream 2.
+
+```
+* connected to localhost port 9000 (BHTTP/1)
+> HEADERS frame  length=180 type=0x01 flags=0x01 [END_STREAM] stream=1
+>   header  00 00 b4 | 01 | 01 | 00 00 01    (length | type | flags | stream)
+>   000000  01 03 47 45 54 02 80 8c  2f 6e 6f 74 65 73 2f 32  |..GET.../notes/2|
+>   000010  30 32 36 2f 6e 65 74 77  6f 72 6b 2d 61 72 63 68  |026/network-arch|
+>   000020  69 74 65 63 74 75 72 65  2f 77 65 65 6b 2d 36 2f  |itecture/week-6/|
+>   000030  69 6e 74 65 72 6f 70 2d  72 65 73 75 6c 74 73 2d  |interop-results-|
+>   000040  62 65 74 77 65 65 6e 2d  6f 75 72 2d 62 73 65 72  |between-our-bser|
+>   000050  76 65 2d 61 6e 64 2d 62  63 75 72 6c 2d 61 6e 64  |ve-and-bcurl-and|
+>   000060  2d 74 68 65 2d 69 6e 64  65 70 65 6e 64 65 6e 74  |-the-independent|
+>   000070  2d 70 79 74 68 6f 6e 2d  70 65 65 72 2d 69 6e 2d  |-python-peer-in-|
+>   000080  74 68 65 2d 74 65 73 74  73 2d 66 6f 6c 64 65 72  |the-tests-folder|
+>   000090  2e 74 78 74 04 0e 6c 6f  63 61 6c 68 6f 73 74 3a  |.txt..localhost:|
+>   0000a0  39 30 30 30 05 09 62 63  75 72 6c 2f 31 2e 30 06  |9000..bcurl/1.0.|
+>   0000b0  03 2a 2f 2a                                       |.*/*|
+>     [#1 ] :method: GET
+>     [#2 ] :path: /notes/2026/network-architecture/week-6/interop-results-between-our-bserve-and-bcurl-and-the-independent-python-peer-in-the-tests-folder.txt
+>     [#4 ] host: localhost:9000
+>     [#5 ] user-agent: bcurl/1.0
+>     [#6 ] accept: */*
+< HEADERS frame  length=80 type=0x01 flags=0x00 stream=1
+<   header  00 00 50 | 01 | 00 | 00 00 01    (length | type | flags | stream)
+<   000000  03 03 34 30 34 07 0a 62  73 65 72 76 65 2f 31 2e  |..404..bserve/1.|
+<   000010  30 08 1d 54 75 65 2c 20  30 36 20 4f 63 74 20 32  |0..Tue, 06 Oct 2|
+<   000020  30 32 36 20 32 31 3a 30  34 3a 33 35 20 47 4d 54  |026 21:04:35 GMT|
+<   000030  09 19 74 65 78 74 2f 70  6c 61 69 6e 3b 20 63 68  |..text/plain; ch|
+<   000040  61 72 73 65 74 3d 75 74  66 2d 38 0a 03 31 35 35  |arset=utf-8..155|
+<     [#3 ] :status: 404
+<     [#7 ] server: bserve/1.0
+<     [#8 ] date: Tue, 06 Oct 2026 21:04:35 GMT
+<     [#9 ] content-type: text/plain; charset=utf-8
+<     [#10] content-length: 155
+< DATA frame  length=155 type=0x00 flags=0x01 [END_STREAM] stream=1
+<   header  00 00 9b | 00 | 01 | 00 00 01    (length | type | flags | stream)
+<   000000  34 30 34 20 4e 6f 74 20  46 6f 75 6e 64 0a 2f 6e  |404 Not Found./n|
+<   000010  6f 74 65 73 2f 32 30 32  36 2f 6e 65 74 77 6f 72  |otes/2026/networ|
+<   000020  6b 2d 61 72 63 68 69 74  65 63 74 75 72 65 2f 77  |k-architecture/w|
+<   000030  65 65 6b 2d 36 2f 69 6e  74 65 72 6f 70 2d 72 65  |eek-6/interop-re|
+<   000040  73 75 6c 74 73 2d 62 65  74 77 65 65 6e 2d 6f 75  |sults-between-ou|
+<   000050  72 2d 62 73 65 72 76 65  2d 61 6e 64 2d 62 63 75  |r-bserve-and-bcu|
+<   000060  72 6c 2d 61 6e 64 2d 74  68 65 2d 69 6e 64 65 70  |rl-and-the-indep|
+<   000070  65 6e 64 65 6e 74 2d 70  79 74 68 6f 6e 2d 70 65  |endent-python-pe|
+<   000080  65 72 2d 69 6e 2d 74 68  65 2d 74 65 73 74 73 2d  |er-in-the-tests-|
+<   000090  66 6f 6c 64 65 72 2e 74  78 74 0a                 |folder.txt.|
+* stream 1: GET /notes/2026/network-architecture/week-6/interop-results-between-our-bserve-and-bcurl-and-the-independent-python-peer-in-the-tests-folder.txt -> 404
+* connection closed, exit 4
+```
 
 ## An unknown frame being skipped
 
-`bcurl --grease` sends this frame on stream 0 before the request:
+`bcurl --grease` sends a frame of type `fa`, from the never-assigned range `f0`–`ff`, on stream 0 before each request. The start of `./bcurl -v --grease localhost:9000/hello.txt`:
 
 ```
-header   00 00 1d fa 00 00 00 00
-payload  75 6e 6b 6e 6f 77 6e 20  66 72 61 6d 65 2c 20 70   unknown frame, p
-         6c 65 61 73 65 20 73 6b  69 70 20 6d 65            lease skip me
+* connected to localhost port 9000 (BHTTP/1)
+> UNKNOWN frame  length=29 type=0xfa flags=0x00 stream=0
+>   header  00 00 1d | fa | 00 | 00 00 00    (length | type | flags | stream)
+>   000000  75 6e 6b 6e 6f 77 6e 20  66 72 61 6d 65 2c 20 70  |unknown frame, p|
+>   000010  6c 65 61 73 65 20 73 6b  69 70 20 6d 65           |lease skip me|
+> HEADERS frame  length=49 type=0x01 flags=0x01 [END_STREAM] stream=1
+>   header  00 00 31 | 01 | 01 | 00 00 01    (length | type | flags | stream)
+>   000000  01 03 47 45 54 02 0a 2f  68 65 6c 6c 6f 2e 74 78  |..GET../hello.tx|
+>   000010  74 04 0e 6c 6f 63 61 6c  68 6f 73 74 3a 39 30 30  |t..localhost:900|
+>   000020  30 05 09 62 63 75 72 6c  2f 31 2e 30 06 03 2a 2f  |0..bcurl/1.0..*/|
+>   000030  2a                                                |*|
+>     [#1 ] :method: GET
+>     [#2 ] :path: /hello.txt
+>     [#4 ] host: localhost:9000
 ```
 
-The header gives Length 0x1d = 29, Type `fa`, which is in the never-assigned range `f0`–`ff`, Flags 0 and stream 0. The server does not know type `fa`, so it reads the 29 payload bytes, discards them and goes on to the HEADERS frame behind it. The response is the same as above. `tests/interop.py` checks the same thing in both directions, with unknown frames before a request, between DATA frames of a response and inside a request body.
+The header gives Length 0x1d = 29, Type `fa`, Flags 0 and stream 0. bserve does not know type `fa`, so it reads the 29 payload bytes, discards them and goes on to the HEADERS frame behind it. The response is the HEADERS and DATA frames shown earlier, byte for byte apart from the date. `tests/interop.py` checks the same rule in both directions: unknown frames before a request, inside a request body and between the DATA frames of a response.
 
-## Raw `-v` output
+## Raw `-v` output of the first exchange
 
 Unedited stderr from the command at the top (`>` sent, `<` received):
 

@@ -46,10 +46,14 @@ void bh_unpack_header(const uint8_t in[BH_FRAME_HEADER_LEN], bh_frame *f);
  * Reads fail with ETIMEDOUT once the deadline set by bh_set_deadline passes
  * (seconds from now; 0 = no deadline). Writes are not affected. */
 void bh_set_deadline(int seconds);
+long long bh_now_ms(void);              /* monotonic clock */
 int bh_read_full(int fd, void *buf, size_t n);
 int bh_write_full(int fd, const void *buf, size_t n);
 
-/* Send one frame. If trace != NULL, hexdump it there with the given direction marker. */
+/* Send one frame. If trace != NULL, hexdump it there with the given direction marker.
+ * With a frame timeout set, a frame the peer has not taken within that many
+ * seconds fails with ETIMEDOUT (pair it with a short SO_SNDTIMEO). */
+void bh_set_frame_timeout(int seconds);
 int bh_send_frame(int fd, uint8_t type, uint8_t flags, uint32_t stream,
                   const void *payload, uint32_t len, FILE *trace);
 
@@ -73,7 +77,8 @@ void bh_buf_free(bh_buf *b);
 typedef struct { const char *name; const char *value; int index; } bh_field;
 typedef struct { bh_field *f; int n; char *arena; } bh_headers;
 
-/* 0 ok, -1 malformed. Enforces SPEC §5: names, values, pseudo-headers first. */
+/* 0 ok, -1 malformed. Enforces SPEC §5: name and value bytes, pseudo-headers
+ * first, no repeats of pseudo-headers, host or content-length. */
 int  bh_hb_decode(const uint8_t *p, size_t len, bh_headers *h);
 int  bh_valid_name(const char *name);     /* literal name a sender may use */
 int  bh_valid_value(const char *value);

@@ -126,6 +126,12 @@ def check(name, cond, detail=""):
         FAIL += 1
         print(f"  FAIL  {name}  {detail}")
 
+SERVER_LOG = os.path.join(tempfile.gettempdir(), f"bserve-test-{os.getpid()}.log")
+
+def start_bserve(*args):
+    """Start bserve with its stderr appended to SERVER_LOG (checked at the end)."""
+    return subprocess.Popen([BSERVE, *args], stderr=open(SERVER_LOG, "ab"))
+
 def free_port():
     s = socket.socket()
     s.bind(("127.0.0.1", 0))
@@ -147,7 +153,7 @@ def connect(port):
 def test_server():
     print("python client -> bserve")
     port = free_port()
-    srv = subprocess.Popen([BSERVE, WWW, str(port)], stderr=subprocess.DEVNULL)
+    srv = start_bserve(WWW, str(port))
     try:
         s = connect(port)
         index = open(os.path.join(WWW, "index.html"), "rb").read()
@@ -326,6 +332,31 @@ def test_server():
         finally:
             os.remove(big)
 
+        # Status precedence: a malformed path is 400 even with an unsupported method.
+        s.close()
+        s = connect(port)
+        request(s, 1, "/" + "a" * 1100, method="POST")
+        check("over-long :path with POST -> 400, not 405", recv_response(s, 1)[0] == 400)
+
+        request(s, 2, "/a" * 480)
+        check("960-byte path to a missing file -> 404 (no PATH_MAX artefact)",
+              recv_response(s, 2)[0] == 404)
+
+        request(s, 3, "/hi.txt", extra=[("host", "a"), ("host", "b")])
+        check("repeated host -> 400", recv_response(s, 3)[0] == 400)
+
+        s.sendall(frame(HEADERS, END_STREAM, 4, enc_headers([(":method", "GET"), (":path", "/hi.txt")]) +
+                        b"\x00\x03a\"b\x01x"))
+        check("literal name with a non-token character -> 400", recv_response(s, 4)[0] == 400)
+
+        request(s, 5, "/nope.html", method="HEAD")
+        st, h, body = recv_response(s, 5)
+        check("HEAD on a missing file -> 404 with no DATA", st == 404 and body == b"")
+
+        request(s, 6, "/hi.txt?next=bhttp://x/y")
+        check("'://' inside the query is just part of the path", recv_response(s, 6)[0] == 200)
+        s.close()
+
         # Pipelining: two requests before reading either response.
         s = connect(port)
         request(s, 1, "/hi.txt"); request(s, 2, "/about.html")
@@ -357,7 +388,7 @@ def test_root_and_timeouts():
         os.symlink(sib, os.path.join(root, "sib-link"))
         os.symlink("ok.txt", os.path.join(root, "in-link"))
         port = free_port()
-        srv = subprocess.Popen([BSERVE, "-t", "2", root, str(port)], stderr=subprocess.DEVNULL)
+        srv = start_bserve("-t", "2", root, str(port))
         try:
             s = connect(port)
             request(s, 1, "/out-link")
@@ -369,6 +400,39 @@ def test_root_and_timeouts():
             st, _, body = recv_response(s, 3)
             check("symlink staying inside the root is served", st == 200 and body == b"ok\n")
             s.close()
+
+            open(os.path.join(root, ".env"), "w").write("SECRET=1\n")
+            s = connect(port)
+            request(s, 4, "/.env")
+            check("dotfile -> 404", recv_response(s, 4)[0] == 404)
+            s.close()
+
+            # One client address may hold at most 16 connections.
+            held = [connect(port) for _ in range(16)]
+            time.sleep(0.3)
+            extra = connect(port)
+            check("17th connection from one address is closed at once", closed_by_peer(extra, wait=2))
+            extra.close()
+            for c in held:
+                c.close()
+            time.sleep(0.5)
+
+            # A client that reads too slowly is dropped instead of holding a process.
+            # (It only sees EOF after draining what the kernel already buffered,
+            # so check the server's log rather than the socket.)
+            open(os.path.join(root, "big.bin"), "wb").write(b"\0" * 8_000_000)
+            s = socket.socket()
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4096)
+            s.connect(("127.0.0.1", port))
+            request(s, 1, "/big.bin")
+            t0, aborted = time.monotonic(), False
+            while time.monotonic() - t0 < 15 and not aborted:
+                s.recv(1024)
+                time.sleep(0.25)
+                aborted = b"client did not take a frame within the timeout" in open(SERVER_LOG, "rb").read()
+            check("slow reader is dropped once a frame waits longer than -t", aborted)
+            s.close()
+            s = connect(port)
 
             # Idle connection is closed after the timeout (2 s here).
             s = connect(port)
@@ -429,7 +493,8 @@ class FakeServer:
                     continue                      # skip unknown
                 h = dec_headers(p)
                 self.requests.append(h)
-                self.routes.get(h[":path"], self.routes["*"])(c, sid)
+                path = h[":path"].split("?")[0]
+                self.routes.get(path, self.routes["*"])(c, sid)
         except (EOFError, OSError):
             c.close()
 
@@ -476,6 +541,12 @@ def test_client():
         "/data-first": raw(lambda sid: frame(DATA, END_STREAM, sid, b"x")),
         "/silent": raw(lambda sid: b""),
         "/big": resp(200, b"z" * 2_000_000, chunks=200),
+        "/short": raw(lambda sid: frame(HEADERS, 0, sid, enc_headers([(":status", "200"),
+                                                                      ("content-length", "10")])) +
+                      frame(DATA, END_STREAM, sid, b"12345")),
+        "/cut": raw(lambda sid: frame(HEADERS, 0, sid, enc_headers([(":status", "200")])) +
+                    frame(DATA, 0, sid, b"partial")),
+        "/early": raw(lambda sid: frame(HEADERS, END_STREAM, sid, enc_headers([(":status", "103")]))),
         "*": resp(404, b"nope\n"),
     })
     try:
@@ -523,9 +594,36 @@ def test_client():
         r = bcurl(f"{base}/plus")
         check(":status that is not three digits -> exit 3", r.returncode == 3)
 
-        r = bcurl(f"{base}/s0")
+        r = bcurl("-v", f"{base}/s0")
         check("400 on stream 0 (connection error) -> exit 3 with the reason",
               r.returncode == 3 and b"you did something odd" in r.stderr)
+        check("-v hexdumps the connection-error frames too",
+              b"|400 Bad Request.|" in r.stderr and b"[#3 ] :status: 400" in r.stderr)
+
+        r = bcurl(f"{base}/short")
+        check("body shorter than content-length -> exit 3", r.returncode == 3)
+
+        r = bcurl("-t", "2", f"{base}/cut")
+        check("connection closed mid-body -> exit 3", r.returncode == 3)
+
+        r = bcurl(f"{base}/early")
+        check("1xx status -> exit 3", r.returncode == 3)
+
+        r = bcurl(f"{base}/ok?next=http://example")
+        check("'://' in the query is accepted", r.returncode == 0)
+
+        r = bcurl(f"{base}?x=1")
+        check("query straight after the authority", r.returncode == 4 and fs.requests[-1][":path"] == "/?x=1")
+
+        r = bcurl("-X", "GE\nT", f"{base}/ok")
+        check("-X with a newline -> usage error", r.returncode == 1)
+
+        r = bcurl("127.0.0.1:+9000/x")
+        check("port with a sign -> usage error", r.returncode == 1)
+
+        t0 = time.monotonic()
+        r = bcurl("-t", "1", "10.255.255.1:9/x")
+        check("connect honours -t", r.returncode == 2 and time.monotonic() - t0 < 5)
 
         r = bcurl(f"{base}/wrong")
         check("response on the wrong stream -> exit 3", r.returncode == 3)
@@ -560,7 +658,7 @@ def test_client():
 def test_end_to_end():
     print("bcurl -> bserve")
     port = free_port()
-    srv = subprocess.Popen([BSERVE, WWW, str(port)], stderr=subprocess.DEVNULL)
+    srv = start_bserve(WWW, str(port))
     try:
         connect(port).close()
         r = bcurl("--grease", f"localhost:{port}/index.html")
@@ -580,5 +678,9 @@ if __name__ == "__main__":
     test_root_and_timeouts()
     test_client()
     test_end_to_end()
+    log = open(SERVER_LOG, "rb").read() if os.path.exists(SERVER_LOG) else b""
+    check("no sanitizer reports in bserve's stderr", b"Sanitizer" not in log and b"runtime error" not in log)
+    if os.path.exists(SERVER_LOG):
+        os.remove(SERVER_LOG)
     print(f"\n{PASS} passed, {FAIL} failed")
     sys.exit(1 if FAIL else 0)

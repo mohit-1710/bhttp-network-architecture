@@ -29,13 +29,15 @@
 #include <unistd.h>
 
 #define SERVER_NAME     "bserve/1.0"
-#define MAX_CHILDREN    64   /* concurrent connections; further accepts wait */
+#define MAX_CHILDREN    128  /* concurrent connections; further accepts wait */
+#define MAX_PER_CLIENT  16   /* connections from one address; more are closed */
 
 static char  g_root[PATH_MAX];
 static FILE *g_trace;               /* stderr when -v, else NULL */
 static char  g_peer[64];
 /* -t: seconds a connection may wait for the next request, seconds to receive
- * the rest of a request once it has started, and seconds a write may stall. */
+ * the rest of a request once it has started, and seconds the client has to
+ * take each frame we send. */
 static int   g_timeout = 30;
 
 /* Log one line. Paths come from the peer, so escape control bytes. */
@@ -112,11 +114,12 @@ static int send_response_headers(int fd, uint32_t sid, int status, const char *c
     return rc;
 }
 
-/* A short text/plain error response. */
+/* A short text/plain error response. A HEAD request gets the headers only. */
 static int send_error(int fd, uint32_t sid, int status, const char *detail, int head_only)
 {
-    char body[512];
-    int n = snprintf(body, sizeof body, "%d %s\n%s\n", status, reason(status), detail);
+    char safe[256], body[512];
+    bh_escape(detail, safe, sizeof safe);          /* never echo raw peer bytes */
+    int n = snprintf(body, sizeof body, "%d %s\n%s\n", status, reason(status), safe);
     if (n < 0 || (size_t)n >= sizeof body)
         n = (int)strlen(body);
     logf_("stream=%u -> %d (%s)", sid, status, detail);
@@ -135,17 +138,10 @@ static int hexval(int c)
     return -1;
 }
 
-/*
- * Map a request path to a file under g_root.
- * Returns 0 and fills out on success, otherwise an HTTP status code.
- */
-static int map_path(const char *path, char *out, size_t outsz)
+/* Cut :path at '?' or '#' and percent-decode it. 0 on success, else 400. */
+static int decode_path(const char *path, char *dec, size_t decsz)
 {
-    char dec[BH_MAX_PATH + 1];
     size_t d = 0;
-    if (strlen(path) > BH_MAX_PATH)
-        return 400;
-    /* Percent-decode up to the query/fragment. */
     for (const char *s = path; *s && *s != '?' && *s != '#'; s++) {
         int c = (unsigned char)*s;
         if (c == '%') {
@@ -157,33 +153,42 @@ static int map_path(const char *path, char *out, size_t outsz)
             if (c == 0)
                 return 400;
         }
-        if (d + 1 >= sizeof dec)
+        if (d + 1 >= decsz)
             return 400;
         dec[d++] = (char)c;
     }
     dec[d] = '\0';
+    return 0;
+}
 
-    /* Reject any ".." segment before touching the filesystem. */
-    for (char *seg = dec; seg; ) {
-        char *next = strchr(seg, '/');
+/*
+ * Map a decoded path to a regular file under g_root.
+ * Returns 0 and fills out (at least PATH_MAX bytes) on success, else 403/404.
+ */
+static int resolve_path(const char *dec, char *out)
+{
+    /* ".." anywhere is refused; other dot segments (".env", ".git") are hidden. */
+    int hidden = 0;
+    for (const char *seg = dec; seg; ) {
+        const char *next = strchr(seg, '/');
         size_t len = next ? (size_t)(next - seg) : strlen(seg);
         if (len == 2 && seg[0] == '.' && seg[1] == '.')
             return 403;
+        if (len > 0 && seg[0] == '.')
+            hidden = 1;
         seg = next ? next + 1 : NULL;
     }
+    if (hidden)
+        return 404;
 
-    char full[PATH_MAX];
-    int n = snprintf(full, sizeof full, "%s%s%s", g_root, dec,
-                     dec[d - 1] == '/' ? "index.html" : "");
-    if (n < 0 || (size_t)n >= sizeof full)
-        return 400;
-
+    /* Room for the root, the whole :path and "/index.html". */
+    char full[PATH_MAX + BH_MAX_PATH + 16];
+    size_t dl = strlen(dec);
+    snprintf(full, sizeof full, "%s%s%s", g_root, dec,
+             dl && dec[dl - 1] == '/' ? "index.html" : "");
     struct stat st;
-    if (stat(full, &st) == 0 && S_ISDIR(st.st_mode)) {
-        if (strlen(full) + sizeof "/index.html" > sizeof full)
-            return 400;
+    if (stat(full, &st) == 0 && S_ISDIR(st.st_mode))
         strcat(full, "/index.html");
-    }
 
     char real[PATH_MAX];
     if (!realpath(full, real))
@@ -192,10 +197,6 @@ static int map_path(const char *path, char *out, size_t outsz)
     size_t rl = strlen(g_root);
     if (rl > 1 && (strncmp(real, g_root, rl) != 0 || (real[rl] != '/' && real[rl] != '\0')))
         return 403;
-    if (stat(real, &st) != 0 || !S_ISREG(st.st_mode))
-        return 404;
-    if (strlen(real) >= outsz)
-        return 400;
     strcpy(out, real);
     return 0;
 }
@@ -207,25 +208,28 @@ static int handle_request(int fd, uint32_t sid, const uint8_t *block, size_t len
     if (bh_hb_decode(block, len, &h) != 0)
         return send_error(fd, sid, 400, "malformed header block", 0);
 
+    /* Checks run in the order of SPEC §6: 400, then 405, then 403/404. */
     const char *method = bh_get(&h, ":method");
     const char *path   = bh_get(&h, ":path");
-    int rc;
-    if (!method || !path || bh_count(&h, ":method") != 1 || bh_count(&h, ":path") != 1 ||
-        bh_get(&h, ":status") || path[0] != '/') {
-        rc = send_error(fd, sid, 400, "request needs exactly one :method and one absolute :path", 0);
-        goto out;
-    }
+    int head = method && strcmp(method, "HEAD") == 0;
+    char dec[BH_MAX_PATH + 1], file[PATH_MAX];
+    int rc, status = 0;
+    const char *why = path;
 
-    int head = strcmp(method, "HEAD") == 0;
-    if (!head && strcmp(method, "GET") != 0) {
-        rc = send_error(fd, sid, 405, "only GET and HEAD are supported", 0);
-        goto out;
+    if (!method || !path || bh_get(&h, ":status") || path[0] != '/' ||
+        strlen(path) > BH_MAX_PATH) {
+        status = 400;
+        why = "request needs one :method and one :path of 1 to 1024 bytes starting with /";
+    } else if (decode_path(path, dec, sizeof dec) != 0) {
+        status = 400;
+    } else if (!head && strcmp(method, "GET") != 0) {
+        status = 405;
+        why = "only GET and HEAD are supported";
+    } else {
+        status = resolve_path(dec, file);
     }
-
-    char file[PATH_MAX];
-    int status = map_path(path, file, sizeof file);
     if (status) {
-        rc = send_error(fd, sid, status, path, head);
+        rc = send_error(fd, sid, status, why, head);
         goto out;
     }
 
@@ -251,8 +255,11 @@ static int handle_request(int fd, uint32_t sid, const uint8_t *block, size_t len
             if (r < 0 && errno == EINTR)
                 continue;
             if (r <= 0) {
-                /* File shrank under us: end the stream cleanly anyway. */
-                rc = bh_send_frame(fd, BH_DATA, BH_FLAG_END_STREAM, sid, NULL, 0, g_trace);
+                /* Read error, or the file shrank. A short body ended with
+                 * END_STREAM would look complete, so drop the connection
+                 * instead (SPEC §4). */
+                logf_("stream=%u aborted: file read failed", sid);
+                rc = -1;
                 break;
             }
             if (r > remaining)
@@ -260,8 +267,11 @@ static int handle_request(int fd, uint32_t sid, const uint8_t *block, size_t len
             remaining -= r;
             rc = bh_send_frame(fd, BH_DATA, remaining == 0 ? BH_FLAG_END_STREAM : 0,
                                sid, chunk, (uint32_t)r, g_trace);
-            if (rc != 0)
+            if (rc != 0) {
+                logf_("stream=%u aborted: %s", sid, errno == ETIMEDOUT
+                      ? "client did not take a frame within the timeout" : "write failed");
                 break;
+            }
         }
     }
     close(ffd);
@@ -270,11 +280,17 @@ out:
     return rc;
 }
 
-/* A connection error (SPEC §6): report it as a 400 on stream 0, then hang up. */
+/* A connection error (SPEC §6): report it as a 400 on stream 0, then hang up.
+ * Reading what the client already sent before closing keeps the kernel from
+ * answering with an RST that could destroy the 400 in flight. */
 static void connection_error(int fd, const char *why)
 {
     send_error(fd, 0, 400, why, 0);
     shutdown(fd, SHUT_WR);
+    bh_set_deadline(2);
+    char junk[4096];
+    while (bh_read_full(fd, junk, 1) == 0 && read(fd, junk, sizeof junk) > 0)
+        ;
 }
 
 static void serve_connection(int fd)
@@ -283,9 +299,9 @@ static void serve_connection(int fd)
     logf_("connected");
     for (;;) {
         bh_frame f;
-        bh_set_deadline(g_timeout);
+        bh_set_deadline(g_timeout);             /* idle wait for the next request */
         int r = bh_next_frame(fd, &f, g_trace);
-        bh_set_deadline(g_timeout);
+        bh_set_deadline(g_timeout);             /* the rest of this request */
         if (r == 1) {
             logf_("client closed connection");
             break;
@@ -347,7 +363,7 @@ static void serve_connection(int fd)
         }
 
         if (oversized)
-            r = send_error(fd, f.stream, 400, "header block too large", 0);
+            r = send_error(fd, f.stream, 400, "header block over 65536 bytes", 0);
         else
             r = handle_request(fd, f.stream, block, f.length);
         free(block);
@@ -397,19 +413,58 @@ static int listen_on(const char *port)
     return fd;
 }
 
-static void peer_name(const struct sockaddr_storage *ss)
+/* Children and the client address each one serves, for the per-client cap. */
+static struct { pid_t pid; char addr[INET6_ADDRSTRLEN]; } g_child[MAX_CHILDREN];
+static int g_nchild;
+
+static void on_sigchld(int sig)
 {
-    char host[INET6_ADDRSTRLEN] = "?";
-    int port = 0;
+    (void)sig;
+}
+
+static void remember_child(pid_t pid, const char *addr)
+{
+    g_child[g_nchild].pid = pid;
+    snprintf(g_child[g_nchild].addr, sizeof g_child[0].addr, "%s", addr);
+    g_nchild++;
+}
+
+static void forget_child(pid_t pid)
+{
+    for (int i = 0; i < g_nchild; i++)
+        if (g_child[i].pid == pid) {
+            g_child[i] = g_child[--g_nchild];
+            return;
+        }
+}
+
+static int count_client(const char *addr)
+{
+    int n = 0;
+    for (int i = 0; i < g_nchild; i++)
+        n += strcmp(g_child[i].addr, addr) == 0;
+    return n;
+}
+
+static void peer_addr(const struct sockaddr_storage *ss, char *out, size_t n)
+{
+    snprintf(out, n, "?");
     if (ss->ss_family == AF_INET6) {
         const struct sockaddr_in6 *a = (const void *)ss;
-        inet_ntop(AF_INET6, &a->sin6_addr, host, sizeof host);
-        port = ntohs(a->sin6_port);
+        inet_ntop(AF_INET6, &a->sin6_addr, out, (socklen_t)n);
     } else if (ss->ss_family == AF_INET) {
         const struct sockaddr_in *a = (const void *)ss;
-        inet_ntop(AF_INET, &a->sin_addr, host, sizeof host);
-        port = ntohs(a->sin_port);
+        inet_ntop(AF_INET, &a->sin_addr, out, (socklen_t)n);
     }
+}
+
+static void peer_name(const struct sockaddr_storage *ss)
+{
+    char host[INET6_ADDRSTRLEN];
+    peer_addr(ss, host, sizeof host);
+    int port = ss->ss_family == AF_INET6 ? ntohs(((const struct sockaddr_in6 *)(const void *)ss)->sin6_port)
+             : ss->ss_family == AF_INET  ? ntohs(((const struct sockaddr_in *)(const void *)ss)->sin_port)
+             : 0;
     snprintf(g_peer, sizeof g_peer, "%s:%d", host, port);
 }
 
@@ -420,8 +475,8 @@ int main(int argc, char **argv)
         if (strcmp(argv[argi], "-v") == 0) {
             g_trace = stderr;
         } else if (strcmp(argv[argi], "-t") == 0 && argi + 1 < argc &&
-                   (g_timeout = atoi(argv[argi + 1])) > 0) {
-            argi++;
+                   atoi(argv[argi + 1]) > 0) {
+            g_timeout = atoi(argv[++argi]);
         } else {
             argi = argc;        /* force the usage message */
             break;
@@ -442,17 +497,23 @@ int main(int argc, char **argv)
     }
 
     signal(SIGPIPE, SIG_IGN);   /* a vanished client must not kill us */
+    /* SIGCHLD interrupts accept() so finished children are reaped promptly. */
+    struct sigaction sa;
+    memset(&sa, 0, sizeof sa);
+    sa.sa_handler = on_sigchld;
+    sigaction(SIGCHLD, &sa, NULL);
 
     int lfd = listen_on(argv[argi + 1]);
     if (lfd < 0)
         return 1;
     fprintf(stderr, "bserve: serving %s on port %s (BHTTP/1)\n", g_root, argv[argi + 1]);
 
-    int children = 0;
     for (;;) {
         /* Reap finished children; at the cap, block until one exits. */
-        while (children > 0 && waitpid(-1, NULL, children >= MAX_CHILDREN ? 0 : WNOHANG) > 0)
-            children--;
+        pid_t done;
+        while (g_nchild > 0 &&
+               (done = waitpid(-1, NULL, g_nchild >= MAX_CHILDREN ? 0 : WNOHANG)) > 0)
+            forget_child(done);
         struct sockaddr_storage ss;
         socklen_t sl = sizeof ss;
         int cfd = accept(lfd, (struct sockaddr *)&ss, &sl);
@@ -463,21 +524,34 @@ int main(int argc, char **argv)
                 usleep(100000);     /* out of descriptors: back off, don't spin */
             continue;
         }
+        char addr[INET6_ADDRSTRLEN];
+        peer_addr(&ss, addr, sizeof addr);
+        if (count_client(addr) >= MAX_PER_CLIENT) {
+            /* One address may not hold every slot. */
+            fprintf(stderr, "[bserve] %s already has %d connections; closing new one\n",
+                    addr, MAX_PER_CLIENT);
+            close(cfd);
+            continue;
+        }
         pid_t pid = fork();
         if (pid == 0) {
             close(lfd);
+            signal(SIGCHLD, SIG_DFL);
             peer_name(&ss);
+            /* Each frame must be taken by the client within -t seconds; the
+             * 1 s SO_SNDTIMEO lets bh_send_frame check that deadline. */
             int one = 1;
-            struct timeval tv = { g_timeout, 0 };
+            struct timeval tv = { 1, 0 };
             setsockopt(cfd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
             setsockopt(cfd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv);
+            bh_set_frame_timeout(g_timeout);
             serve_connection(cfd);
             _exit(0);
         }
         if (pid < 0)
             perror("bserve: fork");
         else
-            children++;
+            remember_child(pid, addr);
         close(cfd);
     }
 }
