@@ -24,12 +24,12 @@
 #define BH_MAX_STRING       0x7FFFu     /* longest string a 2-byte length prefix holds */
 #define BH_MAX_PATH         1024u       /* longest :path a server must handle */
 
-/* Frame types. Anything else is unknown and MUST be skipped.
- * 0xF0-0xFF are never assigned; bcurl --grease sends one to test peers. */
+/* Frame types; all others are skipped (SPEC §3). 0xF0-0xFF are never
+ * assigned, and bcurl --grease sends one to test peers. */
 enum { BH_DATA = 0x00, BH_HEADERS = 0x01 };
 #define BH_GREASE_TYPE 0xFA
 
-/* Flags. Unknown flag bits MUST be ignored by receivers. */
+/* Flags; unknown bits are ignored (SPEC §2). */
 #define BH_FLAG_END_STREAM 0x01
 
 typedef struct {

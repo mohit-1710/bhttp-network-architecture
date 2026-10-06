@@ -197,13 +197,13 @@ static int resolve_path(const char *dec, char *out)
     char real[PATH_MAX];
     if (!realpath(full, real))
         return (errno == EACCES) ? 403 : 404;
-    /* Symlinks must not lead outside the root... */
+    /* Symlinks must not lead outside the root. */
     size_t rl = strlen(g_root);
     if (rl == 1)
         rl = 0;                         /* root "/" */
     if (strncmp(real, g_root, rl) != 0 || (real[rl] != '/' && real[rl] != '\0'))
         return 403;
-    /* ...or to a hidden file or directory inside it. */
+    /* Nor to a hidden file or directory inside it. */
     if (strstr(real + rl, "/."))
         return 404;
     /* Only regular files: opening a FIFO or device could block forever. */
@@ -259,7 +259,8 @@ static int handle_request(int fd, uint32_t sid, const uint8_t *block, size_t len
         int e = ffd < 0 ? errno : ENOENT;
         if (ffd >= 0)
             close(ffd);
-        rc = send_error(fd, sid, e == EACCES ? 403 : 404, path, head);
+        rc = send_error(fd, sid, e == EACCES ? 403 : e == ENOENT || e == ENOTDIR ? 404 : 500,
+                        path, head);
         goto out;
     }
 
@@ -442,6 +443,8 @@ static void on_sigchld(int sig)
 
 static void remember_child(pid_t pid, const char *addr)
 {
+    if (g_nchild >= MAX_CHILDREN)
+        return;                         /* cannot happen: main() reaps below the cap */
     g_child[g_nchild].pid = pid;
     snprintf(g_child[g_nchild].addr, sizeof g_child[0].addr, "%s", addr);
     g_nchild++;
@@ -469,7 +472,10 @@ static void peer_addr(const struct sockaddr_storage *ss, char *out, size_t n)
     snprintf(out, n, "?");
     if (ss->ss_family == AF_INET6) {
         const struct sockaddr_in6 *a = (const void *)ss;
-        inet_ntop(AF_INET6, &a->sin6_addr, out, (socklen_t)n);
+        if (IN6_IS_ADDR_V4MAPPED(&a->sin6_addr))  /* ::ffff:1.2.3.4 is 1.2.3.4 */
+            inet_ntop(AF_INET, &a->sin6_addr.s6_addr[12], out, (socklen_t)n);
+        else
+            inet_ntop(AF_INET6, &a->sin6_addr, out, (socklen_t)n);
     } else if (ss->ss_family == AF_INET) {
         const struct sockaddr_in *a = (const void *)ss;
         inet_ntop(AF_INET, &a->sin_addr, out, (socklen_t)n);
@@ -527,11 +533,16 @@ int main(int argc, char **argv)
     fprintf(stderr, "bserve: serving %s on port %s (BHTTP/1)\n", g_root, argv[argi + 1]);
 
     for (;;) {
-        /* Reap finished children; at the cap, block until one exits. */
+        /* Reap finished children; at the cap, block until one exits. A signal
+         * can interrupt waitpid, so keep going until there is a free slot. */
         pid_t done;
-        while (g_nchild > 0 &&
-               (done = waitpid(-1, NULL, g_nchild >= MAX_CHILDREN ? 0 : WNOHANG)) > 0)
-            forget_child(done);
+        while (g_nchild > 0) {
+            done = waitpid(-1, NULL, g_nchild >= MAX_CHILDREN ? 0 : WNOHANG);
+            if (done > 0)
+                forget_child(done);
+            else if (g_nchild < MAX_CHILDREN || (done < 0 && errno != EINTR))
+                break;
+        }
         struct sockaddr_storage ss;
         socklen_t sl = sizeof ss;
         int cfd = accept(lfd, (struct sockaddr *)&ss, &sl);

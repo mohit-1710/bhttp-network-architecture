@@ -14,3 +14,14 @@ jobs:
         run: make CFLAGS="-O2 -g -std=c11 -D_DEFAULT_SOURCE -D_DARWIN_C_SOURCE -Wall -Wextra -Wpedantic -Werror"
       - name: test
         run: python3 tests/interop.py
+
+  sanitizers:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: build bserve and bcurl with ASan and UBSan
+        run: make CFLAGS="-O1 -g -std=c11 -D_DEFAULT_SOURCE -Wall -Wextra -fsanitize=address,undefined -fno-omit-frame-pointer -fno-sanitize-recover=all"
+      - name: test (a sanitizer report in bserve's log fails the last check)
+        run: ASAN_OPTIONS=detect_leaks=0 python3 tests/interop.py
+      - name: fuzz the header-block decoder
+        run: make fuzz

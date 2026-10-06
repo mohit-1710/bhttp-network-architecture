@@ -12,7 +12,14 @@ bcurl: src/bcurl.c src/bproto.c src/bproto.h
 test: all
 	python3 tests/interop.py
 
-clean:
-	rm -rf bserve bcurl *.dSYM
+SANFLAGS = -O1 -g -std=c11 -D_DEFAULT_SOURCE -D_DARWIN_C_SOURCE -Wall -Wextra \
+           -fsanitize=address,undefined -fno-omit-frame-pointer -fno-sanitize-recover=all
 
-.PHONY: all test clean
+fuzz: tests/fuzz_hb.c src/bproto.c src/bproto.h
+	$(CC) $(SANFLAGS) -o fuzz_hb tests/fuzz_hb.c src/bproto.c
+	./fuzz_hb 300000
+
+clean:
+	rm -rf bserve bcurl fuzz_hb *.dSYM
+
+.PHONY: all test fuzz clean

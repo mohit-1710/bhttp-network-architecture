@@ -506,6 +506,15 @@ class FakeServer:
             self.accepts += 1
             threading.Thread(target=self.handle, args=(c,), daemon=True).start()
 
+    def drip(self, c, sid):
+        """Send a 1-byte unknown frame every 0.4 s and never answer."""
+        try:
+            for _ in range(40):
+                c.sendall(frame(0xF3, 0, 0, b"."))
+                time.sleep(0.4)
+        except OSError:
+            pass
+
     def handle(self, c):
         try:
             while True:
@@ -515,6 +524,9 @@ class FakeServer:
                 h = dec_headers(p)
                 self.requests.append(h)
                 path = h[":path"].split("?")[0]
+                if path == "/drip":
+                    self.drip(c, sid)
+                    continue
                 self.routes.get(path, self.routes["*"])(c, sid)
         except (EOFError, OSError):
             c.close()
@@ -577,6 +589,8 @@ def test_client():
                         frame(DATA, 0, sid, b"part") +
                         frame(HEADERS, 0, 0, enc_headers([(":status", "400")])) +
                         frame(DATA, END_STREAM, 0, b"400 Bad Request\nyour second request was odd\n")),
+        "/bigreason": raw(lambda sid: frame(HEADERS, 0, 0, enc_headers([(":status", "400")])) +
+                          frame(DATA, END_STREAM, 0, b"start of a long reason " + b"x" * 5000)),
         "/early": raw(lambda sid: frame(HEADERS, END_STREAM, sid, enc_headers([(":status", "103")]))),
         "*": resp(404, b"nope\n"),
     })
@@ -660,6 +674,21 @@ def test_client():
 
         r = bcurl(f"{base}/ok#section")
         check("#fragment is not sent", r.returncode == 0 and fs.requests[-1][":path"] == "/ok")
+
+        t0 = time.monotonic()
+        r = bcurl("-t", "2", f"{base}/drip")
+        check("unknown frames trickling in do not keep bcurl waiting past -t",
+              r.returncode == 3 and time.monotonic() - t0 < 6)
+
+        r = bcurl(f"{base}/bigreason")
+        check("a 5 KB connection-error reason is shown (truncated), not dropped",
+              r.returncode == 3 and b"start of a long reason" in r.stderr)
+
+        r = bcurl(f"{base}/ok", "/ok#frag")
+        check("#fragment is not sent on extra paths either", fs.requests[-1][":path"] == "/ok")
+
+        r = bcurl("-X", "X1", f"{base}/ok")
+        check("-X accepts any token", r.returncode == 0 and fs.requests[-1][":method"] == "X1")
 
         r = bcurl("-t", "5x", f"{base}/ok")
         check("-t must be a whole number of seconds", r.returncode == 1)

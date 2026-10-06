@@ -13,7 +13,7 @@
 
 ## Architecture
 
-bserve and bcurl share no code at run time; they talk only over TCP, using the format in [SPEC.md](SPEC.md). The four parts in purple are where the design decisions are: the fixed frame header, the rule for unknown frame types, the static header table, and keeping every path inside the document root.
+bserve and bcurl talk only over TCP, using the format in [SPEC.md](SPEC.md) (two pages as [docs/SPEC.pdf](docs/SPEC.pdf)); [HEXDUMP.md](HEXDUMP.md) goes through real exchanges byte by byte. Purple marks the four parts I made real choices about: the 8-byte header, skipping unknown frame types, the 10-name static table, and keeping paths inside the root.
 
 ```mermaid
 flowchart LR
@@ -48,9 +48,9 @@ flowchart LR
     style ROOT fill:#6f4cff,color:#fff,stroke:#5a3de0
 ```
 
-### One connection, start to finish
+### Errors on one connection
 
-bcurl numbers its requests 1, 2, 3 on a single connection. A 404 or a malformed request is answered on its own stream and the connection carries on. Only a broken frame sequence (here a stream ID going backwards) gets a `400` on stream 0 and a close.
+bcurl numbers its requests 1, 2, 3 on a single connection. A 404 or a malformed request is answered on its own stream. Only a broken frame sequence (here a stream ID going backwards) gets a `400` on stream 0 and a close.
 
 ```mermaid
 sequenceDiagram
@@ -65,10 +65,10 @@ sequenceDiagram
     S-->>C: DATA stream 1 [END_STREAM] "Hello, binary HTTP!\n"
 
     C->>S: HEADERS stream 2 [END_STREAM] :path /nope
-    S-->>C: HEADERS + DATA stream 2: 404, connection stays open
+    S-->>C: HEADERS + DATA stream 2: 404
 
     C->>S: HEADERS stream 3 with a bad header block
-    S-->>C: HEADERS + DATA stream 3: 400, connection stays open
+    S-->>C: HEADERS + DATA stream 3: 400
 
     C->>S: HEADERS stream 2 again (ID not increasing)
     S-->>C: HEADERS + DATA on stream 0: 400 with the reason
@@ -77,7 +77,7 @@ sequenceDiagram
 
 ### Reading a frame
 
-Every receiver, client or server, runs the same loop. The `Length` field is why the unknown-type rule is safe: a v1 peer always knows how far to skip, even past frame types invented later.
+Every receiver, client or server, runs the same loop. Length tells a v1 peer how far to skip, so frame types added in v2 are safe to ignore.
 
 ```mermaid
 flowchart TB
@@ -93,8 +93,6 @@ flowchart TB
 
     style U fill:#6f4cff,color:#fff,stroke:#5a3de0
 ```
-
-The full rules are in [SPEC.md](SPEC.md) (two pages as [docs/SPEC.pdf](docs/SPEC.pdf)), and [HEXDUMP.md](HEXDUMP.md) goes through a real exchange byte by byte.
 
 ---
 
@@ -113,25 +111,20 @@ The full rules are in [SPEC.md](SPEC.md) (two pages as [docs/SPEC.pdf](docs/SPEC
 
 A real request for `/hello.txt` starts with the header `00 00 31 01 01 00 00 01`: Length 49, HEADERS, END_STREAM, stream 1. The 49-byte header block follows.
 
-| tag | name | tag | name | tag | name | tag | name | tag | name |
-|---|---|---|---|---|---|---|---|---|---|
-| 1 | `:method` | 3 | `:status` | 5 | `user-agent` | 7 | `server` | 9 | `content-type` |
-| 2 | `:path` | 4 | `host` | 6 | `accept` | 8 | `date` | 10 | `content-length` |
-
-Literal names and all values are length-prefixed; the encoding is in SPEC §5.
+Ten common names (`:method`, `:path`, `:status`, `host`, `user-agent`, `accept`, `server`, `date`, `content-type`, `content-length`) are sent as one-byte tags; other names, and all values, are length-prefixed. The encoding is in SPEC §5.
 
 ---
 
-## What it does
+## What bserve and bcurl do
 
-| Feature | Behaviour |
+| Part | What it does |
 |---|---|
-| Track 1: server | `bserve ./www 9000` reads binary frames, maps `:path` under the root, answers `200` with the file as DATA frames, `404` if missing, `400` if malformed, and keeps the connection open for the next request. |
+| Track 1: server | `bserve ./www 9000` reads binary frames, maps `:path` under the root, answers `200` with the file as DATA frames, `404` if missing and `400` if malformed. |
 | Track 2: client | `bcurl -v localhost:9000/index.html` builds the request frame, writes the body to stdout, hexdumps every frame with `-v`, exits 4 on 4xx and 5 on 5xx, and sends any extra paths on the same connection. |
 | Unknown frames | Both sides skip frame types they do not know, on any stream and between any two frames. `--grease` sends a type `0xFA` frame first, to check that the server skips it. |
 | Path safety | `..` gives 403. Dotfiles, FIFOs and other non-regular files give 404, even through a symlink. Symlinks must stay inside the root, including the case of a sibling directory whose name starts with the root's name. |
-| Error model | Stream errors (400, 403, 404, 405) keep the connection; connection errors (stream ID going backwards, stray DATA) get a 400 on stream 0, then a close. |
-| Abuse limits | Idle and request deadlines, a per-frame write deadline for slow readers, 128 connections total and 16 per client address. |
+| Errors | Stream errors (400, 403, 404, 405) keep the connection; connection errors (stream ID going backwards, stray DATA) get a 400 on stream 0, then a close. |
+| Timeouts and caps | Idle and request deadlines, a per-frame write deadline for slow readers, 128 connections total and 16 per client address. bcurl gives each response frame `-t` seconds, so a server cannot hold it open with unknown frames or trickled bytes. |
 | Truncated bodies | If a file read fails mid-body the server drops the connection instead of sending END_STREAM, and the client checks `content-length` against the bytes received. |
 
 ---
@@ -148,7 +141,7 @@ Literal names and all values are length-prefixed; the encoding is in SPEC §5.
 | End of body | END_STREAM, checked against `content-length` | `content-length` alone (can't stream unknown sizes); END_STREAM alone (can't detect a cut-off body) |
 | Version 2 | new frame types, negotiated by a frame v1 skips | a version byte in every header; a connection preface |
 
-SPEC §8 compares these with HTTP/2's 9-byte header (24 / 8 / 8 / 1 reserved + 31) and its earlier 8-byte drafts.
+Background on HTTP/2's header and its 8-byte drafts: SPEC §8.
 
 ---
 
@@ -162,7 +155,8 @@ Apple M5 Pro, loopback, release build (`make`):
 | 10 000 requests over one connection, one at a time | about 0.52 s, about 19 000 requests/s (52 µs each) |
 | 200 MB file, 12 208 DATA frames | about 0.095 s, about 2.1 GB/s, byte-identical |
 | Framing overhead on a full DATA frame | 8 / 16 392 bytes = 0.05 % |
-| Tests (C programs against a separate Python implementation) | 95 passing on Ubuntu and macOS ([CI](.github/workflows/ci.yml)) |
+| Tests (C programs against a separate Python implementation) | 99 passing on Ubuntu and macOS, and again under ASan and UBSan ([CI](.github/workflows/ci.yml)) |
+| Header-block fuzzing (`make fuzz`, under ASan and UBSan) | 300 000 mutated blocks, no crashes |
 
 ---
 
@@ -185,7 +179,7 @@ make test                                              # the interop tests
 | Program | Options |
 |---|---|
 | `bserve [-v] [-t seconds] <root> <port>` | `-v` hexdumps frames on the server side. `-t` (default 30) is the idle wait for the next request, the time allowed to receive a started request, and the time the client has to take each frame. The tests use `-t 2`. |
-| `bcurl [-v] [-I] [-X method] [-H 'name: value'] [-t seconds] [--grease] url [paths]` | `-v` hexdumps every frame to stderr. `-I` sends HEAD and prints the response headers. `-H host`, `user-agent` or `accept` replace the defaults. `-t` (default 30) is the connect timeout and the longest wait for data. |
+| `bcurl [-v] [-I] [-X method] [-H 'name: value'] [-t seconds] [--grease] url [paths]` | `-v` hexdumps every frame to stderr. `-I` sends HEAD and prints the response headers. `-H host`, `user-agent` or `accept` replace the defaults. `-t` (default 30) is the connect timeout and the time each response frame has to arrive in full; unknown frames do not extend it. |
 
 bcurl exits with 0 when every status is below 400, 4 for a 4xx, 5 for a 5xx, 3 for a protocol, timeout or output error, 2 when it cannot connect and 1 for bad arguments.
 
@@ -193,15 +187,18 @@ bcurl exits with 0 when every status is below 400, 4 for a 4xx, 5 for a 5xx, 3 f
 
 ## Tests
 
-[tests/interop.py](tests/interop.py) has its own frame and header-block code, written from SPEC.md, so a bug shared by bserve and bcurl still fails. It runs three groups.
+[tests/interop.py](tests/interop.py) has its own frame and header-block code, written from SPEC.md rather than from `src/` (its docstring explains why). The cases that took the most work:
 
-A Python client against bserve: every status code, HEAD, keep-alive and pipelining, unknown frame types and flags, malformed, oversized and exactly-64-KiB header blocks, connection errors on stream 0, truncated frames, path traversal, symlinks, dotfiles and a FIFO, the per-client connection cap, idle, slow-sender and slow-reader timeouts, and a 300 KB file across DATA frames.
+- a header block of exactly 65 535 bytes, and one with 300 fields;
+- a slow reader, a slow sender and an idle connection, each cut off by the deadlines;
+- a FIFO, a dotfile behind a symlink, and a symlink into a sibling directory whose name starts with the root's name;
+- 300 requests that the Python server counts as one TCP connection;
+- a body that runs past `content-length`, and a connection error arriving in the middle of a body;
+- bcurl started with stdout closed.
 
-bcurl against a Python server: unknown frames between DATA frames, every exit code, 300 requests counted as one TCP connection by the server, responses on the wrong stream, DATA before HEADERS, bad `:status`, `content-length` mismatches, a body cut off mid-stream or running past `content-length`, DATA on a HEAD response, a connection error arriving mid-body, escaping of control bytes in `-v`, a server that never answers, a connect timeout and a closed stdout.
+The rest of the list is printed by `make test`.
 
-bcurl against bserve, end to end, including `--grease`.
-
-bserve's stderr is kept during the run, and the last check fails if it contains a sanitizer report. I also ran the whole suite with both programs built with `-fsanitize=address,undefined`.
+bserve's stderr is kept during the run, and the last check fails if it contains a sanitizer report. CI runs the suite a second time with both programs built with `-fsanitize=address,undefined`, then runs `make fuzz`, which feeds 300 000 mutated header blocks to the decoder.
 
 ---
 
@@ -214,6 +211,7 @@ src/bproto.[ch]         frame header, header-block codec, deadlines, -v hexdump
 src/bserve.c            Track 1, the server
 src/bcurl.c             Track 2, the client
 tests/interop.py        Python implementation of the spec + the tests
+tests/fuzz_hb.c         mutation fuzzer for the header-block decoder (make fuzz)
 www/                    sample document root
-.github/workflows/      CI: build with -Werror and test on Ubuntu and macOS
+.github/workflows/      CI: -Werror build and tests on Ubuntu and macOS, plus a sanitizer + fuzz job
 ```

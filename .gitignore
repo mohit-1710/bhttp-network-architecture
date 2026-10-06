@@ -4,3 +4,4 @@ bcurl
 *.o
 .DS_Store
 __pycache__/
+fuzz_hb

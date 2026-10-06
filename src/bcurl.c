@@ -186,8 +186,14 @@ static void add_header(options *o, const char *arg)
         name[k] = (char)tolower((unsigned char)arg[k]);
     name[nl] = '\0';
     const char *val = colon ? colon + 1 : "";
-    while (*val == ' ')
+    while (*val == ' ' || *val == '\t')
         val++;
+    char *v = strdup(val);              /* trailing spaces and tabs are trimmed too */
+    if (!v)
+        exit(EX_USAGE);
+    for (size_t k = strlen(v); k > 0 && (v[k - 1] == ' ' || v[k - 1] == '\t'); k--)
+        v[k - 1] = '\0';
+    val = v;
     if (strcmp(name, "content-length") == 0) {
         fprintf(stderr, "bcurl: requests carry no body, so -H content-length is not allowed\n");
         exit(EX_USAGE);
@@ -208,13 +214,7 @@ static void add_header(options *o, const char *arg)
 
 static int valid_method(const char *m)
 {
-    size_t n = strlen(m);
-    if (n == 0 || n > 32)
-        return 0;
-    for (size_t i = 0; i < n; i++)
-        if (!isalpha((unsigned char)m[i]) && m[i] != '-' && m[i] != '_')
-            return 0;
-    return 1;
+    return strlen(m) <= 32 && bh_valid_name_any_case(m);
 }
 
 static int valid_status(const char *s)
@@ -294,11 +294,17 @@ static void report_connection_error(int fd, const bh_frame *f)
     size_t used = 0;
     int end = f->flags & BH_FLAG_END_STREAM;
     bh_frame d;
-    while (!end && bh_next_frame(fd, &d, g_trace) == 0 && d.type == BH_DATA && d.stream == 0 &&
-           used + d.length < sizeof msg) {
-        if (bh_read_payload(fd, &d, (uint8_t *)msg + used, g_trace) != 0)
+    while (!end && bh_next_frame(fd, &d, g_trace) == 0 && d.type == BH_DATA && d.stream == 0) {
+        /* Keep what fits of the reason; read and drop the rest. */
+        uint8_t *buf = malloc(d.length ? d.length : 1);
+        if (!buf || bh_read_payload(fd, &d, buf, g_trace) != 0) {
+            free(buf);
             break;
-        used += d.length;
+        }
+        size_t take = d.length < sizeof msg - 1 - used ? d.length : sizeof msg - 1 - used;
+        memcpy(msg + used, buf, take);
+        used += take;
+        free(buf);
         end = d.flags & BH_FLAG_END_STREAM;
     }
     msg[used] = '\0';
@@ -310,6 +316,9 @@ static void report_connection_error(int fd, const bh_frame *f)
 static int read_response(int fd, uint32_t sid, int head, int show_headers)
 {
     bh_frame f;
+    /* Each HEADERS or DATA frame must arrive in full within -t seconds.
+     * Unknown frames and trickled bytes do not extend that. */
+    bh_set_deadline(g_timeout);
     if (bh_next_frame(fd, &f, g_trace) != 0) {
         fprintf(stderr, "bcurl: connection %s before a response arrived\n", closed_or_timed_out());
         return -1;
@@ -359,6 +368,7 @@ static int read_response(int fd, uint32_t sid, int head, int show_headers)
         return -1;
     }
     while (!end) {
+        bh_set_deadline(g_timeout);
         if (bh_next_frame(fd, &f, g_trace) != 0) {
             fprintf(stderr, "bcurl: connection %s mid-response (body incomplete)\n",
                     closed_or_timed_out());
@@ -444,7 +454,7 @@ int main(int argc, char **argv)
     if (nurls == 0)
         usage();
     if (!valid_method(o.method)) {
-        fprintf(stderr, "bcurl: bad method (letters, '-' or '_', at most 32)\n");
+        fprintf(stderr, "bcurl: bad method (an HTTP token of at most 32 characters)\n");
         return EX_USAGE;
     }
 
@@ -465,11 +475,17 @@ int main(int argc, char **argv)
     for (int i = 1; i < nurls; i++) {
         ts[i] = base;
         if (urls[i][0] == '/') {
-            if (strlen(urls[i]) > BH_MAX_PATH || !bh_valid_value(urls[i])) {
+            size_t pl = strcspn(urls[i], "#");     /* a #fragment is not sent */
+            if (pl > BH_MAX_PATH) {
                 fprintf(stderr, "bcurl: bad path '%s'\n", urls[i]);
                 return EX_USAGE;
             }
-            strcpy(ts[i].path, urls[i]);
+            memcpy(ts[i].path, urls[i], pl);
+            ts[i].path[pl] = '\0';
+            if (!bh_valid_value(ts[i].path)) {
+                fprintf(stderr, "bcurl: bad path '%s'\n", urls[i]);
+                return EX_USAGE;
+            }
         } else if (parse_url(urls[i], &ts[i]) != 0 || strcasecmp(ts[i].host, base.host) != 0 ||
                    strcmp(ts[i].port, base.port) != 0) {
             fprintf(stderr, "bcurl: '%s' is not on %s:%s; bcurl never opens a second connection\n",
