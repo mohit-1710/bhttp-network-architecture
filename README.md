@@ -1,35 +1,33 @@
 # bhttp-network-architecture
 
-> HTTP, in binary. A two-page protocol spec (BHTTP/1), a file server that speaks it (`bserve`), a curl-like client (`bcurl`), and a byte-by-byte annotated hexdump of one request and response. Frames have a fixed **8-byte header**, header names come from a **10-entry static table** or are sent as length-prefixed literals, and every receiver **skips frame types it does not know**, which is what leaves room for a version 2.
+> BHTTP/1 is a binary framing for HTTP requests. This repo has its two-page spec, a file server (`bserve`), a client (`bcurl`) and an annotated hexdump of one exchange. Frames have an 8-byte header, header names are either one of 10 table tags or a literal, and receivers skip unknown frame types so that a v2 can add new ones.
 
 ![C11](https://img.shields.io/badge/C11-6f4cff?style=flat-square&logo=c&logoColor=white)
 ![POSIX sockets](https://img.shields.io/badge/POSIX%20sockets-6f4cff?style=flat-square&logo=linux&logoColor=white)
 ![Python tests](https://img.shields.io/badge/interop%20peer-Python-6f4cff?style=flat-square&logo=python&logoColor=white)
-![tests](https://img.shields.io/badge/tests-81%20passing-6f4cff?style=flat-square)
 ![frame header](https://img.shields.io/badge/frame%20header-8%20bytes-6f4cff?style=flat-square)
 ![spec](https://img.shields.io/badge/spec-2%20pages-6f4cff?style=flat-square)
-![keep-alive](https://img.shields.io/badge/one%20connection-19k%20req%2Fs-6f4cff?style=flat-square)
 [![build and test](https://github.com/mohit-1710/bhttp-network-architecture/actions/workflows/ci.yml/badge.svg)](https://github.com/mohit-1710/bhttp-network-architecture/actions/workflows/ci.yml)
 
 ---
 
 ## Architecture
 
-The two programs share nothing at run time except bytes on one TCP connection, and the only thing that defines those bytes is [SPEC.md](SPEC.md). The four parts in **purple** are where the design decisions are: the fixed frame header, the rule for unknown frame types, the static header table, and keeping every path inside the document root.
+bserve and bcurl share no code at run time; they talk only over TCP, using the format in [SPEC.md](SPEC.md). The four parts in purple are where the design decisions are: the fixed frame header, the rule for unknown frame types, the static header table, and keeping every path inside the document root.
 
 ```mermaid
 flowchart LR
-    subgraph client["bcurl (Track 2)"]
+    subgraph client["bcurl"]
       ARGS["URL + extra paths<br/>-v, -I, -H, --grease"]
       ENC["header block encoder<br/>tag 1-10 or literal"]
       OUT["body → stdout<br/>exit 0 / 3 / 4 / 5"]
     end
 
-    subgraph wire["one TCP connection, many streams"]
+    subgraph wire["one TCP connection, streams 1, 2, 3 …"]
       FH{{"8-byte frame header<br/>Length 24 · Type 8 · Flags 8 · Stream 24"}}
     end
 
-    subgraph server["bserve (Track 1)"]
+    subgraph server["bserve"]
       RD["frame reader"]
       SKIP["unknown type?<br/>skip Length bytes"]
       DEC[("static table<br/>10 names")]
@@ -96,7 +94,7 @@ flowchart TB
     style U fill:#6f4cff,color:#fff,stroke:#5a3de0
 ```
 
-The full rules are in **[SPEC.md](SPEC.md)** (also as a two-page **[docs/SPEC.pdf](docs/SPEC.pdf)**). Every byte of a real exchange is explained in **[HEXDUMP.md](HEXDUMP.md)**.
+The full rules are in [SPEC.md](SPEC.md) (two pages as [docs/SPEC.pdf](docs/SPEC.pdf)), and [HEXDUMP.md](HEXDUMP.md) goes through a real exchange byte by byte.
 
 ---
 
@@ -113,28 +111,28 @@ The full rules are in **[SPEC.md](SPEC.md)** (also as a two-page **[docs/SPEC.pd
 |                 payload: Length bytes ...                     |
 ```
 
-A real request for `/hello.txt` is 57 bytes: the header `00 00 31 01 01 00 00 01` (Length 49, HEADERS, END_STREAM, stream 1) and a 49-byte header block. The same request as HTTP/1.1 text is 85 bytes.
+A real request for `/hello.txt` starts with the header `00 00 31 01 01 00 00 01`: Length 49, HEADERS, END_STREAM, stream 1. The 49-byte header block follows.
 
 | tag | name | tag | name | tag | name | tag | name | tag | name |
 |---|---|---|---|---|---|---|---|---|---|
 | 1 | `:method` | 3 | `:status` | 5 | `user-agent` | 7 | `server` | 9 | `content-type` |
 | 2 | `:path` | 4 | `host` | 6 | `accept` | 8 | `date` | 10 | `content-length` |
 
-Tag 0 means "literal name follows". Each string has a one-byte length (0 to 127) or a two-byte length with the top bit set (up to 32 767).
+Literal names and all values are length-prefixed; the encoding is in SPEC §5.
 
 ---
 
 ## What it does
 
-| Area | How |
+| Feature | Behaviour |
 |---|---|
-| **Track 1: server** | `bserve ./www 9000` reads binary frames, maps `:path` under the root, answers `200` with the file as DATA frames, `404` if missing, `400` if malformed, and keeps the connection open for the next request. |
-| **Track 2: client** | `bcurl -v localhost:9000/index.html` builds the request frame, writes the body to stdout, hexdumps every frame with `-v`, exits 4 on 4xx and 5 on 5xx, and sends any extra paths on the same connection. |
-| **Unknown frames** | Both sides skip frame types they do not know, on any stream and between any two frames. `--grease` sends type `0xFA` to prove the server does. |
-| **Path safety** | `..` gives 403, dotfiles give 404, and symlinks are resolved and must stay inside the root (including the case of a sibling directory whose name starts with the root's name). |
-| **Error model** | Stream errors (400, 403, 404, 405) keep the connection; connection errors (stream ID going backwards, stray DATA) get a 400 on stream 0, then a close. |
-| **Abuse limits** | Idle and request deadlines, a per-frame write deadline for slow readers, 128 connections total and 16 per client address. |
-| **Honest bodies** | If a file read fails mid-body the server drops the connection instead of sending END_STREAM, and the client checks `content-length`, so a cut-off body is never reported as complete. |
+| Track 1: server | `bserve ./www 9000` reads binary frames, maps `:path` under the root, answers `200` with the file as DATA frames, `404` if missing, `400` if malformed, and keeps the connection open for the next request. |
+| Track 2: client | `bcurl -v localhost:9000/index.html` builds the request frame, writes the body to stdout, hexdumps every frame with `-v`, exits 4 on 4xx and 5 on 5xx, and sends any extra paths on the same connection. |
+| Unknown frames | Both sides skip frame types they do not know, on any stream and between any two frames. `--grease` sends a type `0xFA` frame first, to check that the server skips it. |
+| Path safety | `..` gives 403. Dotfiles, FIFOs and other non-regular files give 404, even through a symlink. Symlinks must stay inside the root, including the case of a sibling directory whose name starts with the root's name. |
+| Error model | Stream errors (400, 403, 404, 405) keep the connection; connection errors (stream ID going backwards, stray DATA) get a 400 on stream 0, then a close. |
+| Abuse limits | Idle and request deadlines, a per-frame write deadline for slow readers, 128 connections total and 16 per client address. |
+| Truncated bodies | If a file read fails mid-body the server drops the connection instead of sending END_STREAM, and the client checks `content-length` against the bytes received. |
 
 ---
 
@@ -150,7 +148,7 @@ Tag 0 means "literal name follows". Each string has a one-byte length (0 to 127)
 | End of body | END_STREAM, checked against `content-length` | `content-length` alone (can't stream unknown sizes); END_STREAM alone (can't detect a cut-off body) |
 | Version 2 | new frame types, negotiated by a frame v1 skips | a version byte in every header; a connection preface |
 
-Section 8 of the [spec](SPEC.md) explains each choice next to HTTP/2's 24 / 8 / 8 / 31.
+SPEC §8 compares these with HTTP/2's 9-byte header (24 / 8 / 8 / 1 reserved + 31) and its earlier 8-byte drafts.
 
 ---
 
@@ -160,11 +158,11 @@ Apple M5 Pro, loopback, release build (`make`):
 
 | Measurement | Value |
 |---|---|
-| Request for `/hello.txt` on the wire | **57 bytes** (HTTP/1.1 text: 85) |
-| 10 000 requests over one connection, one at a time | **about 0.52 s**, about 19 000 requests/s (52 µs each) |
-| 200 MB file, 12 208 DATA frames | **about 0.095 s**, about 2.1 GB/s, byte-identical |
+| Request for `/hello.txt` on the wire | 57 bytes (HTTP/1.1 text: 85) |
+| 10 000 requests over one connection, one at a time | about 0.52 s, about 19 000 requests/s (52 µs each) |
+| 200 MB file, 12 208 DATA frames | about 0.095 s, about 2.1 GB/s, byte-identical |
 | Framing overhead on a full DATA frame | 8 / 16 392 bytes = 0.05 % |
-| Tests (C programs against a separate Python implementation) | **81 passing** on Ubuntu and macOS ([CI](.github/workflows/ci.yml)) |
+| Tests (C programs against a separate Python implementation) | 95 passing on Ubuntu and macOS ([CI](.github/workflows/ci.yml)) |
 
 ---
 
@@ -172,13 +170,13 @@ Apple M5 Pro, loopback, release build (`make`):
 
 ```bash
 make                                   # builds ./bserve and ./bcurl (C11, no dependencies)
-./bserve ./www 9000                    # Track 1
-./bcurl -v localhost:9000/index.html   # Track 2
+./bserve ./www 9000
+./bcurl -v localhost:9000/index.html
 ```
 
 ```bash
 ./bcurl localhost:9000/index.html /about.html /nope    # three requests, one connection; exits 4 for the 404
-./bcurl -I localhost:9000/img/dot.png                  # HEAD
+./bcurl -I localhost:9000/img/dot.png                  # HEAD; prints the response headers
 ./bcurl -v --grease localhost:9000/hello.txt           # an unknown frame first; the server skips it
 ./bcurl -v -H 'x-trace-id: 7f3a' localhost:9000/hello.txt   # a header outside the static table
 make test                                              # the interop tests
@@ -187,19 +185,19 @@ make test                                              # the interop tests
 | Program | Options |
 |---|---|
 | `bserve [-v] [-t seconds] <root> <port>` | `-v` hexdumps frames on the server side. `-t` (default 30) is the idle wait for the next request, the time allowed to receive a started request, and the time the client has to take each frame. The tests use `-t 2`. |
-| `bcurl [-v] [-I] [-X method] [-H 'name: value'] [-t seconds] [--grease] url [paths]` | `-v` hexdumps every frame to stderr. `-I` sends HEAD. `-t` (default 30) is the connect timeout and the longest wait for data. |
+| `bcurl [-v] [-I] [-X method] [-H 'name: value'] [-t seconds] [--grease] url [paths]` | `-v` hexdumps every frame to stderr. `-I` sends HEAD and prints the response headers. `-H host`, `user-agent` or `accept` replace the defaults. `-t` (default 30) is the connect timeout and the longest wait for data. |
 
-bcurl exit codes: **0** every status below 400 · **4** a 4xx · **5** a 5xx · **3** protocol, timeout or output error · **2** cannot connect · **1** bad arguments.
+bcurl exits with 0 when every status is below 400, 4 for a 4xx, 5 for a 5xx, 3 for a protocol, timeout or output error, 2 when it cannot connect and 1 for bad arguments.
 
 ---
 
 ## Tests
 
-[tests/interop.py](tests/interop.py) has its own frame and header-block code written from SPEC.md, sharing nothing with `src/`. That way a bug copied into both bserve and bcurl would still fail here. It runs three groups.
+[tests/interop.py](tests/interop.py) has its own frame and header-block code, written from SPEC.md, so a bug shared by bserve and bcurl still fails. It runs three groups.
 
-A Python client against bserve: every status code, HEAD, keep-alive and pipelining, unknown frame types and flags, malformed, oversized and exactly-64-KiB header blocks, connection errors on stream 0, truncated frames, path traversal, symlinks and dotfiles, the per-client connection cap, idle, slow-sender and slow-reader timeouts, and a 300 KB file across DATA frames.
+A Python client against bserve: every status code, HEAD, keep-alive and pipelining, unknown frame types and flags, malformed, oversized and exactly-64-KiB header blocks, connection errors on stream 0, truncated frames, path traversal, symlinks, dotfiles and a FIFO, the per-client connection cap, idle, slow-sender and slow-reader timeouts, and a 300 KB file across DATA frames.
 
-bcurl against a Python server: unknown frames between DATA frames, every exit code, 300 requests counted as one TCP connection by the server, responses on the wrong stream, DATA before HEADERS, bad `:status`, `content-length` mismatches, a body cut off mid-stream, escaping of control bytes in `-v`, a server that never answers, a connect timeout and a closed stdout.
+bcurl against a Python server: unknown frames between DATA frames, every exit code, 300 requests counted as one TCP connection by the server, responses on the wrong stream, DATA before HEADERS, bad `:status`, `content-length` mismatches, a body cut off mid-stream or running past `content-length`, DATA on a HEAD response, a connection error arriving mid-body, escaping of control bytes in `-v`, a server that never answers, a connect timeout and a closed stdout.
 
 bcurl against bserve, end to end, including `--grease`.
 

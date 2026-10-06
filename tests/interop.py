@@ -243,19 +243,19 @@ def test_server():
         check("300 header fields accepted", st == 200)
 
         block = enc_headers([(":method", "GET"), (":path", "/hi.txt")])
-        while len(block) < 65536:             # pad with literal fields to exactly 64 KiB
-            left = 65536 - len(block)
+        while len(block) < 65535:             # pad with literal fields to exactly 65535 bytes
+            left = 65535 - len(block)
             n = left - 4 if left - 4 < 128 else min(0x7FFF, left - 5)
-            if 0 < 65536 - len(block) - (n + (4 if n < 128 else 5)) < 6:
+            if 0 < 65535 - len(block) - (n + (4 if n < 128 else 5)) < 6:
                 n -= 10                        # leave room for one more whole field
             block += enc_headers([("x", "a" * n)])
         s.sendall(frame(HEADERS, END_STREAM, 18, block))
         st, _, _ = recv_response(s, 18)
-        check("header block of exactly 65536 bytes accepted", len(block) == 65536 and st == 200)
+        check("header block of exactly 65535 bytes accepted", len(block) == 65535 and st == 200)
 
         s.sendall(frame(HEADERS, END_STREAM, 19, block + b"\x00\x01y\x00"))
         st, _, _ = recv_response(s, 19)
-        check("header block over 65536 bytes -> 400", st == 400)
+        check("header block over 65535 bytes -> 400", st == 400)
 
         s.sendall(frame(HEADERS, END_STREAM, 20,
                         enc_headers([("accept", "*/*"), (":method", "GET"), (":path", "/hi.txt")])))
@@ -353,8 +353,21 @@ def test_server():
         st, h, body = recv_response(s, 5)
         check("HEAD on a missing file -> 404 with no DATA", st == 404 and body == b"")
 
-        request(s, 6, "/hi.txt?next=bhttp://x/y")
-        check("'://' inside the query is just part of the path", recv_response(s, 6)[0] == 200)
+        request(s, 7, "/hi.txt", method="G T")
+        check(":method that is not a token -> 400", recv_response(s, 7)[0] == 400)
+
+        request(s, 8, "/hi.txt", method="get")
+        check("lowercase method is a valid token but not GET -> 405", recv_response(s, 8)[0] == 405)
+
+        s.sendall(frame(HEADERS, END_STREAM, 9, enc_headers([(":method", "GET"), (":path", "/hi.txt"),
+                                                             (":status", "200")])))
+        check(":status in a request -> 400", recv_response(s, 9)[0] == 400)
+
+        request(s, 12, "/hi.txt", extra=[("content-length", "+0")])
+        check("content-length that is not plain digits -> 400", recv_response(s, 12)[0] == 400)
+
+        request(s, 13, "/hi.txt?next=bhttp://x/y")
+        check("'://' inside the query is just part of the path", recv_response(s, 13)[0] == 200)
         s.close()
 
         # Pipelining: two requests before reading either response.
@@ -402,9 +415,17 @@ def test_root_and_timeouts():
             s.close()
 
             open(os.path.join(root, ".env"), "w").write("SECRET=1\n")
+            os.symlink(".env", os.path.join(root, "env-link"))
+            os.mkfifo(os.path.join(root, "pipe"))
             s = connect(port)
             request(s, 4, "/.env")
             check("dotfile -> 404", recv_response(s, 4)[0] == 404)
+            request(s, 5, "/env-link")
+            check("symlink to a dotfile -> 404", recv_response(s, 5)[0] == 404)
+            request(s, 6, "/pipe")
+            s.settimeout(3)
+            check("FIFO in the root -> 404 at once, not a hang", recv_response(s, 6)[0] == 404)
+            s.settimeout(None)
             s.close()
 
             # One client address may hold at most 16 connections.
@@ -546,6 +567,16 @@ def test_client():
                       frame(DATA, END_STREAM, sid, b"12345")),
         "/cut": raw(lambda sid: frame(HEADERS, 0, sid, enc_headers([(":status", "200")])) +
                     frame(DATA, 0, sid, b"partial")),
+        "/long": raw(lambda sid: frame(HEADERS, 0, sid, enc_headers([(":status", "200"),
+                                                                     ("content-length", "3")])) +
+                     frame(DATA, END_STREAM, sid, b"x" * 100_000)),
+        "/headdata": raw(lambda sid: frame(HEADERS, 0, sid, enc_headers([(":status", "200"),
+                                                                         ("content-length", "5")])) +
+                         frame(DATA, END_STREAM, sid, b"HELLO")),
+        "/midbody": raw(lambda sid: frame(HEADERS, 0, sid, enc_headers([(":status", "200")])) +
+                        frame(DATA, 0, sid, b"part") +
+                        frame(HEADERS, 0, 0, enc_headers([(":status", "400")])) +
+                        frame(DATA, END_STREAM, 0, b"400 Bad Request\nyour second request was odd\n")),
         "/early": raw(lambda sid: frame(HEADERS, END_STREAM, sid, enc_headers([(":status", "103")]))),
         "*": resp(404, b"nope\n"),
     })
@@ -605,6 +636,33 @@ def test_client():
 
         r = bcurl("-t", "2", f"{base}/cut")
         check("connection closed mid-body -> exit 3", r.returncode == 3)
+
+        r = bcurl(f"{base}/long")
+        check("body longer than content-length -> exit 3, nothing past it written",
+              r.returncode == 3 and r.stdout == b"")
+
+        r = bcurl("-I", f"{base}/headdata")
+        check("DATA on a HEAD response -> exit 3", r.returncode == 3)
+
+        r = bcurl(f"{base}/midbody")
+        check("connection error arriving mid-body is reported with its reason",
+              r.returncode == 3 and b"your second request was odd" in r.stderr)
+
+        r = bcurl("-I", f"{base}/empty")
+        check("-I prints the response headers", r.returncode == 0 and b":status: 204" in r.stdout)
+
+        r = bcurl("-H", "Host: example.test", f"{base}/ok")
+        check("-H host replaces the default instead of repeating it",
+              r.returncode == 0 and fs.requests[-1]["host"] == "example.test")
+
+        r = bcurl(f"{base}/" + "a" * 1023)
+        check("1024-byte path is accepted", r.returncode == 4 and len(fs.requests[-1][":path"]) == 1024)
+
+        r = bcurl(f"{base}/ok#section")
+        check("#fragment is not sent", r.returncode == 0 and fs.requests[-1][":path"] == "/ok")
+
+        r = bcurl("-t", "5x", f"{base}/ok")
+        check("-t must be a whole number of seconds", r.returncode == 1)
 
         r = bcurl(f"{base}/early")
         check("1xx status -> exit 3", r.returncode == 3)

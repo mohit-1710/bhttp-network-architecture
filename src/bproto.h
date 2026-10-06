@@ -19,7 +19,7 @@
 #define BH_FRAME_HEADER_LEN 8
 #define BH_MAX_LENGTH       0xFFFFFFu   /* 24-bit length field */
 #define BH_MAX_STREAM       0xFFFFFFu   /* 24-bit stream id    */
-#define BH_MAX_HEADER_BLOCK 65536u      /* receivers MUST accept at least this */
+#define BH_MAX_HEADER_BLOCK 65535u      /* largest header block; receivers accept any up to this */
 #define BH_DATA_CHUNK       16384u      /* senders SHOULD NOT exceed this per DATA frame */
 #define BH_MAX_STRING       0x7FFFu     /* longest string a 2-byte length prefix holds */
 #define BH_MAX_PATH         1024u       /* longest :path a server must handle */
@@ -78,10 +78,13 @@ typedef struct { const char *name; const char *value; int index; } bh_field;
 typedef struct { bh_field *f; int n; char *arena; } bh_headers;
 
 /* 0 ok, -1 malformed. Enforces SPEC §5: name and value bytes, pseudo-headers
- * first, no repeats of pseudo-headers, host or content-length. */
+ * first, no repeats of pseudo-headers, host or content-length, and a
+ * content-length of 1 to 18 digits. */
 int  bh_hb_decode(const uint8_t *p, size_t len, bh_headers *h);
 int  bh_valid_name(const char *name);     /* literal name a sender may use */
 int  bh_valid_value(const char *value);
+int  bh_valid_name_any_case(const char *name);  /* HTTP token, e.g. a method */
+int  bh_parse_seconds(const char *s);           /* "1".."3600" -> value, else 0 */
 const char *bh_get(const bh_headers *h, const char *name);
 int  bh_count(const bh_headers *h, const char *name);
 void bh_headers_free(bh_headers *h);

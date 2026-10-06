@@ -92,11 +92,13 @@ static int parse_url(const char *url, target *t)
     } else {
         strcpy(t->port, DEFAULT_PORT);
     }
-    /* "host?x" means "/?x". */
+    /* "host?x" means "/?x". A #fragment never leaves the client. */
     const char *rest = url + alen;
-    if (strlen(rest) + 1 > BH_MAX_PATH)
+    size_t rlen = strcspn(rest, "#");
+    size_t plen = rlen + (*rest != '/');
+    if (plen > BH_MAX_PATH)
         return -1;
-    snprintf(t->path, sizeof t->path, "%s%s", *rest == '/' ? "" : "/", rest);
+    snprintf(t->path, sizeof t->path, "%s%.*s", *rest == '/' ? "" : "/", (int)rlen, rest);
     return bh_valid_value(t->path) ? 0 : -1;
 }
 
@@ -157,7 +159,16 @@ typedef struct {
     const char *values[MAX_EXTRA];
     int nextra;
     int grease;
+    int show_headers;               /* -I: print response headers to stdout */
 } options;
+
+static const char *find_extra(const options *o, const char *name)
+{
+    for (int i = 0; i < o->nextra; i++)
+        if (strcmp(o->names[i], name) == 0)
+            return o->values[i];
+    return NULL;
+}
 
 /* Split and check a -H 'name: value' argument against SPEC §5. */
 static void add_header(options *o, const char *arg)
@@ -177,6 +188,15 @@ static void add_header(options *o, const char *arg)
     const char *val = colon ? colon + 1 : "";
     while (*val == ' ')
         val++;
+    if (strcmp(name, "content-length") == 0) {
+        fprintf(stderr, "bcurl: requests carry no body, so -H content-length is not allowed\n");
+        exit(EX_USAGE);
+    }
+    if (find_extra(o, name) && (!strcmp(name, "host") || !strcmp(name, "user-agent") ||
+                                !strcmp(name, "accept"))) {
+        fprintf(stderr, "bcurl: -H %s given twice\n", name);
+        exit(EX_USAGE);
+    }
     if (!colon || !bh_valid_name(name) || !bh_valid_value(val)) {
         fprintf(stderr, "bcurl: bad header '%s' (want 'name: value', name made of HTTP "
                         "token characters, value under 32768 bytes without CR/LF)\n", arg);
@@ -222,14 +242,19 @@ static int send_request(int fd, uint32_t sid, const target *t, const options *o)
     else
         snprintf(authority, sizeof authority, "%s:%s", t->host, t->port);
 
+    /* -H host/user-agent/accept replace the defaults rather than repeat them. */
+    const char *host = find_extra(o, "host"), *ua = find_extra(o, "user-agent"),
+               *accept = find_extra(o, "accept");
     bh_buf b = { 0 };
     bh_hb_add(&b, ":method", o->method);
     bh_hb_add(&b, ":path", t->path);
-    bh_hb_add(&b, "host", authority);
-    bh_hb_add(&b, "user-agent", USER_AGENT);
-    bh_hb_add(&b, "accept", "*/*");
+    bh_hb_add(&b, "host", host ? host : authority);
+    bh_hb_add(&b, "user-agent", ua ? ua : USER_AGENT);
+    bh_hb_add(&b, "accept", accept ? accept : "*/*");
     for (int i = 0; i < o->nextra; i++)
-        bh_hb_add(&b, o->names[i], o->values[i]);
+        if (strcmp(o->names[i], "host") && strcmp(o->names[i], "user-agent") &&
+            strcmp(o->names[i], "accept"))
+            bh_hb_add(&b, o->names[i], o->values[i]);
     int rc = -1;
     if (b.err || b.len > BH_MAX_HEADER_BLOCK)
         fprintf(stderr, "bcurl: request headers exceed %u bytes\n", BH_MAX_HEADER_BLOCK);
@@ -282,7 +307,7 @@ static void report_connection_error(int fd, const bh_frame *f)
 }
 
 /* Read one response on stream sid. Returns the status code, or -1. */
-static int read_response(int fd, uint32_t sid, int head)
+static int read_response(int fd, uint32_t sid, int head, int show_headers)
 {
     bh_frame f;
     if (bh_next_frame(fd, &f, g_trace) != 0) {
@@ -312,6 +337,11 @@ static int read_response(int fd, uint32_t sid, int head)
     long long want = -1;
     if (valid_status(s) && !bh_get(&h, ":method") && !bh_get(&h, ":path"))
         status = atoi(s);
+    if (show_headers && status > 0) {
+        char vb[4 * 1024 + 8];
+        for (int i = 0; i < h.n; i++)
+            printf("%s: %s\n", h.f[i].name, bh_escape(h.f[i].value, vb, sizeof vb));
+    }
     if (cl && *cl && strspn(cl, "0123456789") == strlen(cl) && strlen(cl) < 19)
         want = atoll(cl);
     else if (cl)
@@ -324,14 +354,27 @@ static int read_response(int fd, uint32_t sid, int head)
 
     long long got = 0;
     int end = f.flags & BH_FLAG_END_STREAM;
+    if (head && !end) {
+        fprintf(stderr, "bcurl: response to HEAD does not end with its HEADERS frame\n");
+        return -1;
+    }
     while (!end) {
         if (bh_next_frame(fd, &f, g_trace) != 0) {
             fprintf(stderr, "bcurl: connection %s mid-response (body incomplete)\n",
                     closed_or_timed_out());
             return -1;
         }
+        if (f.type == BH_HEADERS && f.stream == 0 && f.length <= BH_MAX_HEADER_BLOCK) {
+            report_connection_error(fd, &f);
+            return -1;
+        }
         if (f.type != BH_DATA || f.stream != sid) {
             fprintf(stderr, "bcurl: expected DATA on stream %u\n", sid);
+            return -1;
+        }
+        /* Stop before writing anything past content-length. */
+        if (want >= 0 && got + f.length > want) {
+            fprintf(stderr, "bcurl: body is longer than content-length %lld\n", want);
             return -1;
         }
         /* Stream the payload to stdout without buffering the whole body. */
@@ -381,14 +424,16 @@ int main(int argc, char **argv)
         const char *a = argv[i];
         if (strcmp(a, "-v") == 0)
             g_trace = stderr;
-        else if (strcmp(a, "-I") == 0)
+        else if (strcmp(a, "-I") == 0) {
             o.method = "HEAD";
+            o.show_headers = 1;
+        }
         else if (strcmp(a, "-X") == 0 && i + 1 < argc)
             o.method = argv[++i];
         else if (strcmp(a, "-H") == 0 && i + 1 < argc)
             add_header(&o, argv[++i]);
-        else if (strcmp(a, "-t") == 0 && i + 1 < argc && atoi(argv[i + 1]) > 0)
-            g_timeout = atoi(argv[++i]);
+        else if (strcmp(a, "-t") == 0 && i + 1 < argc && bh_parse_seconds(argv[i + 1]) > 0)
+            g_timeout = bh_parse_seconds(argv[++i]);
         else if (strcmp(a, "--grease") == 0)
             o.grease = 1;
         else if (a[0] == '-')
@@ -425,7 +470,7 @@ int main(int argc, char **argv)
                 return EX_USAGE;
             }
             strcpy(ts[i].path, urls[i]);
-        } else if (parse_url(urls[i], &ts[i]) != 0 || strcmp(ts[i].host, base.host) != 0 ||
+        } else if (parse_url(urls[i], &ts[i]) != 0 || strcasecmp(ts[i].host, base.host) != 0 ||
                    strcmp(ts[i].port, base.port) != 0) {
             fprintf(stderr, "bcurl: '%s' is not on %s:%s; bcurl never opens a second connection\n",
                     urls[i], base.host, base.port);
@@ -454,7 +499,7 @@ int main(int argc, char **argv)
             rc = EX_PROTO;
             break;
         }
-        int status = read_response(fd, sid, head);
+        int status = read_response(fd, sid, head, o.show_headers);
         if (status < 0) {
             if (i + 1 < nurls)
                 fprintf(stderr, "bcurl: %d later request(s) not sent\n", nurls - i - 1);

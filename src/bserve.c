@@ -187,16 +187,28 @@ static int resolve_path(const char *dec, char *out)
     snprintf(full, sizeof full, "%s%s%s", g_root, dec,
              dl && dec[dl - 1] == '/' ? "index.html" : "");
     struct stat st;
-    if (stat(full, &st) == 0 && S_ISDIR(st.st_mode))
-        strcat(full, "/index.html");
+    if (stat(full, &st) == 0 && S_ISDIR(st.st_mode)) {
+        size_t fl = strlen(full);
+        if (fl + sizeof "/index.html" > sizeof full)
+            return 404;
+        memcpy(full + fl, "/index.html", sizeof "/index.html");
+    }
 
     char real[PATH_MAX];
     if (!realpath(full, real))
         return (errno == EACCES) ? 403 : 404;
-    /* Symlinks must not lead outside the root. */
+    /* Symlinks must not lead outside the root... */
     size_t rl = strlen(g_root);
-    if (rl > 1 && (strncmp(real, g_root, rl) != 0 || (real[rl] != '/' && real[rl] != '\0')))
+    if (rl == 1)
+        rl = 0;                         /* root "/" */
+    if (strncmp(real, g_root, rl) != 0 || (real[rl] != '/' && real[rl] != '\0'))
         return 403;
+    /* ...or to a hidden file or directory inside it. */
+    if (strstr(real + rl, "/."))
+        return 404;
+    /* Only regular files: opening a FIFO or device could block forever. */
+    if (stat(real, &st) != 0 || !S_ISREG(st.st_mode))
+        return 404;
     strcpy(out, real);
     return 0;
 }
@@ -216,10 +228,15 @@ static int handle_request(int fd, uint32_t sid, const uint8_t *block, size_t len
     int rc, status = 0;
     const char *why = path;
 
-    if (!method || !path || bh_get(&h, ":status") || path[0] != '/' ||
-        strlen(path) > BH_MAX_PATH) {
+    if (!method || !path || path[0] != '/' || strlen(path) > BH_MAX_PATH) {
         status = 400;
         why = "request needs one :method and one :path of 1 to 1024 bytes starting with /";
+    } else if (bh_get(&h, ":status")) {
+        status = 400;
+        why = ":status is not allowed in a request";
+    } else if (!bh_valid_name_any_case(method)) {
+        status = 400;
+        why = ":method must be a token";
     } else if (decode_path(path, dec, sizeof dec) != 0) {
         status = 400;
     } else if (!head && strcmp(method, "GET") != 0) {
@@ -234,8 +251,9 @@ static int handle_request(int fd, uint32_t sid, const uint8_t *block, size_t len
     }
 
     /* realpath() already resolved every link; O_NOFOLLOW stops a symlink
-     * swapped in since then, and fstat checks what we actually opened. */
-    int ffd = open(file, O_RDONLY | O_NOFOLLOW);
+     * swapped in since then, O_NONBLOCK stops a FIFO swapped in from
+     * blocking us, and fstat checks what we actually opened. */
+    int ffd = open(file, O_RDONLY | O_NOFOLLOW | O_NONBLOCK);
     struct stat st;
     if (ffd < 0 || fstat(ffd, &st) != 0 || !S_ISREG(st.st_mode)) {
         int e = ffd < 0 ? errno : ENOENT;
@@ -363,7 +381,7 @@ static void serve_connection(int fd)
         }
 
         if (oversized)
-            r = send_error(fd, f.stream, 400, "header block over 65536 bytes", 0);
+            r = send_error(fd, f.stream, 400, "header block over 65535 bytes", 0);
         else
             r = handle_request(fd, f.stream, block, f.length);
         free(block);
@@ -475,8 +493,8 @@ int main(int argc, char **argv)
         if (strcmp(argv[argi], "-v") == 0) {
             g_trace = stderr;
         } else if (strcmp(argv[argi], "-t") == 0 && argi + 1 < argc &&
-                   atoi(argv[argi + 1]) > 0) {
-            g_timeout = atoi(argv[++argi]);
+                   (g_timeout = bh_parse_seconds(argv[argi + 1])) > 0) {
+            argi++;
         } else {
             argi = argc;        /* force the usage message */
             break;

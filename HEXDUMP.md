@@ -8,7 +8,7 @@ This is one exchange between `./bcurl` and `./bserve ./www 9000`. The request as
 
 On the wire there are three frames and 189 bytes: a 74-byte request and a 115-byte response.
 
-Offsets in the tables count from the first payload byte, as in the `-v` output. Payload offset 0x00 is byte 8 of the frame. The unedited `-v` output of each capture is included.
+Offsets in the tables count from the first payload byte, starting at 0, as in the `-v` output, so payload offset 0x00 is frame byte 8 (also counted from 0). The `-v` output of the first two captures is included unedited; the third is cut after the request.
 
 ## Request, client to server (one frame, 8 + 66 bytes)
 
@@ -108,9 +108,13 @@ Every string above is shorter than 128 bytes, so each length took one byte with 
 | payload 0x06 | `80 8c` | top bit set, so two bytes: 0x008c = 140 |
 | payload 0x08 | `2f 6e 6f 74 65 73 …` | the 140-byte path, ending at 0x93 |
 | request total | | 5 + (1 + 2 + 140) + 16 + 11 + 5 = 180 = 0xb4 |
-| response HEADERS | `03 03 34 30 34` | `:status` `404`; Flags 0, so a body follows |
-| response HEADERS | `0a 03 31 35 35` | `content-length` `155` |
-| response DATA | `00 00 9b 00 01 00 00 01` | Length 0x9b = 155, END_STREAM: `404 Not Found\n` plus the path and a newline (14 + 140 + 1) |
+| response header | `00 00 50 01 00 00 00 01` | Length 0x50 = 80, HEADERS, Flags 0 (a body follows), stream 1 |
+| payload 0x00 | `03 03 34 30 34` | tag 3 `:status`, length 3, `404` |
+| payload 0x05 | `07 0a 62 73 … 2e 30` | tag 7 `server`, length 10, `bserve/1.0` |
+| payload 0x11 | `08 1d 54 75 … 4d 54` | tag 8 `date`, length 29 |
+| payload 0x30 | `09 19 74 65 … 2d 38` | tag 9 `content-type`, length 25, `text/plain; charset=utf-8` |
+| payload 0x4b | `0a 03 31 35 35` | tag 10 `content-length`, length 3, `155` (ends at 0x4f, the 80th byte) |
+| response DATA | `00 00 9b 00 01 00 00 01` | Length 0x9b = 155, DATA, END_STREAM, stream 1: `404 Not Found\n` plus the path and a newline (14 + 140 + 1) |
 
 bcurl wrote the 155-byte body to stdout and exited with 4 because the status was 4xx. The connection was still usable: a second path on the same command line would have gone out as stream 2.
 
@@ -184,7 +188,7 @@ bcurl wrote the 155-byte body to stdout and exited with 4 because the status was
 >     [#4 ] host: localhost:9000
 ```
 
-The header gives Length 0x1d = 29, Type `fa`, Flags 0 and stream 0. bserve does not know type `fa`, so it reads the 29 payload bytes, discards them and goes on to the HEADERS frame behind it. The response is the HEADERS and DATA frames shown earlier, byte for byte apart from the date. `tests/interop.py` checks the same rule in both directions: unknown frames before a request, inside a request body and between the DATA frames of a response.
+The header gives Length 0x1d = 29, Type `fa`, Flags 0 and stream 0. bserve does not know type `fa`, so it reads the 29 payload bytes, discards them and goes on to the HEADERS frame behind it. bserve then answers the request with a HEADERS and a DATA frame laid out exactly like the first exchange's. `tests/interop.py` checks the same rule in both directions: unknown frames before a request, inside a request body and between the DATA frames of a response.
 
 ## Raw `-v` output of the first exchange
 

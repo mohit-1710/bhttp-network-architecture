@@ -149,11 +149,11 @@ int bh_send_frame(int fd, uint8_t type, uint8_t flags, uint32_t stream,
         ssize_t w = writev(fd, v, cnt);
         if (w < 0) {
             /* EAGAIN here means SO_SNDTIMEO passed with nothing written. */
-            if (errno == EINTR ||
-                ((errno == EAGAIN || errno == EWOULDBLOCK) && deadline && bh_now_ms() < deadline))
+            int e = errno;
+            int again = e == EAGAIN || e == EWOULDBLOCK;
+            if (e == EINTR || (again && deadline && bh_now_ms() < deadline))
                 continue;
-            if (errno == EAGAIN || errno == EWOULDBLOCK)
-                errno = ETIMEDOUT;      /* peer is reading too slowly */
+            errno = again ? ETIMEDOUT : e;  /* ETIMEDOUT: peer reads too slowly */
             return -1;
         }
         if (deadline && cnt > 0 && bh_now_ms() >= deadline &&
@@ -301,8 +301,8 @@ static int name_ok(const uint8_t *s, size_t n)
         return 0;
     for (size_t i = 0; i < n; i++) {
         uint8_t c = s[i];
-        if (!((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || strchr("!#$%&'*+-.^_`|~", c)) ||
-            c == 0)
+        if (!((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') ||
+              (c && strchr("!#$%&'*+-.^_`|~", c))))
             return 0;
     }
     return 1;
@@ -319,6 +319,27 @@ static int value_ok(const uint8_t *s, size_t n)
 int bh_valid_name(const char *name)
 {
     return name_ok((const uint8_t *)name, strlen(name)) && strlen(name) <= BH_MAX_STRING;
+}
+
+int bh_valid_name_any_case(const char *name)
+{
+    size_t n = strlen(name);
+    if (n == 0 || n > BH_MAX_STRING)
+        return 0;
+    for (size_t i = 0; i < n; i++) {
+        unsigned char c = (unsigned char)name[i];
+        if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') ||
+              (c && strchr("!#$%&'*+-.^_`|~", c))))
+            return 0;
+    }
+    return 1;
+}
+
+int bh_parse_seconds(const char *s)
+{
+    char *end;
+    long v = strtol(s, &end, 10);
+    return (*s >= '0' && *s <= '9' && *end == '\0' && v >= 1 && v <= 3600) ? (int)v : 0;
 }
 
 int bh_valid_value(const char *value)
@@ -377,6 +398,10 @@ int bh_hb_decode(const uint8_t *p, size_t len, bh_headers *h)
     for (size_t i = 0; i < sizeof once / sizeof once[0]; i++)
         if (bh_count(h, once[i]) > 1)
             goto bad;
+    /* content-length is 1 to 18 digits, nothing else. */
+    const char *cl = bh_get(h, "content-length");
+    if (cl && (!*cl || strlen(cl) > 18 || strspn(cl, "0123456789") != strlen(cl)))
+        goto bad;
     return 0;
 bad:
     bh_headers_free(h);
