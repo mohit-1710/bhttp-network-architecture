@@ -95,7 +95,7 @@ After END_STREAM the client could have sent stream 2 on the same socket. It had 
 
 ## A 404 with a two-byte length
 
-Every string above is shorter than 128 bytes, so each length took one byte with the top bit clear. Longer strings set the top bit and use 15 bits across two bytes: 127 is `7f`, 128 is `80 80`, 300 is `81 2c` and the largest, 32 767, is `ff ff`. Asking for a file that does not exist, with a name I made up to be 140 bytes long, also gives a 404, so one capture shows both:
+Every string above is shorter than 128 bytes, so each length took one byte with the top bit clear. Longer strings set the top bit and use 15 bits across two bytes: 127 is `7f`, 128 is `80 80`, 300 is `81 2c` and the largest, 32 767, is `ff ff`. Asking for a file that does not exist, with a path I made up to be 140 bytes long, also gives a 404, so one capture shows both:
 
 ```
 ./bcurl -v localhost:9000/notes/2026/week-6/binary-framing-lab-log-with-every-request-and-response-sent-while-testing-the-server-on-tuesday-evening-in-lab-3-rm-b.txt

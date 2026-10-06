@@ -29,8 +29,8 @@
 #include <unistd.h>
 
 #define SERVER_NAME     "bserve/1.0"
-#define MAX_CHILDREN    128  /* concurrent connections; further accepts wait */
-#define MAX_PER_CLIENT  16   /* connections from one address; more are closed */
+#define MAX_CHILDREN    128  /* concurrent connections; more are refused */
+#define MAX_PER_CLIENT  32   /* connections from one address; more are refused */
 
 static char  g_root[PATH_MAX];
 static FILE *g_trace;               /* stderr when -v, else NULL */
@@ -172,36 +172,55 @@ static int inside_root(const char *real)
 
 /* For a path that does not resolve: does what exists of it already lead
  * outside the root? Follows a dangling symlink's target and otherwise the
- * longest existing prefix, so a 404 never confirms anything out there. */
-static int leads_outside(const char *path, int depth)
+ * longest existing prefix, so a 404 never confirms anything out there.
+ * Iterative with heap buffers, so a path full of slashes cannot exhaust
+ * the stack; a symlink loop or a chain of more than 8 links counts as
+ * unresolvable (404), as SPEC §6 says. */
+static int leads_outside(const char *start)
 {
-    char real[PATH_MAX], part[PATH_MAX + BH_MAX_PATH + 16];
-    if (depth > 8 || strlen(path) >= sizeof part)
-        return 1;                       /* too many links to tell: treat as outside */
-    if (realpath(path, real))
-        return !inside_root(real);
-    struct stat st;
-    if (lstat(path, &st) == 0 && S_ISLNK(st.st_mode)) {
-        char target[PATH_MAX];
-        ssize_t n = readlink(path, target, sizeof target - 1);
-        if (n < 0)
-            return 1;
-        target[n] = '\0';
-        if (target[0] == '/') {
-            strcpy(part, target);
-        } else {                        /* relative to the link's directory */
-            strcpy(part, path);
-            char *slash = strrchr(part, '/');
-            snprintf(slash + 1, sizeof part - (size_t)(slash + 1 - part), "%s", target);
+    size_t cap = PATH_MAX + BH_MAX_PATH + 16;
+    char *path = malloc(cap), *real = malloc(PATH_MAX), *target = malloc(PATH_MAX);
+    int result = 0, hops = 0;
+    if (!path || !real || !target || strlen(start) >= cap)
+        goto out;
+    strcpy(path, start);
+    for (;;) {
+        if (realpath(path, real)) {
+            result = !inside_root(real);
+            break;
         }
-        return leads_outside(part, depth + 1);
+        struct stat st;
+        if (lstat(path, &st) == 0 && S_ISLNK(st.st_mode)) {
+            if (++hops > 8)
+                break;                  /* loop or long chain: 404 */
+            ssize_t n = readlink(path, target, PATH_MAX - 1);
+            if (n < 0)
+                break;
+            target[n] = '\0';
+            if (target[0] == '/') {
+                strcpy(path, target);
+            } else {                    /* relative to the link's directory */
+                char *slash = strrchr(path, '/');
+                size_t keep = (size_t)(slash - path) + 1;
+                if (keep + (size_t)n >= cap)
+                    break;
+                memcpy(path + keep, target, (size_t)n + 1);
+            }
+            continue;
+        }
+        /* Drop the last component (and any run of slashes before it). */
+        char *slash = strrchr(path, '/');
+        while (slash && slash > path && slash[-1] == '/')
+            slash--;
+        if (!slash || slash == path)
+            break;
+        *slash = '\0';
     }
-    strcpy(part, path);
-    char *slash = strrchr(part, '/');
-    if (!slash || slash == part)
-        return 0;
-    *slash = '\0';
-    return leads_outside(part, depth);  /* only symlink hops count as depth */
+out:
+    free(path);
+    free(real);
+    free(target);
+    return result;
 }
 
 /*
@@ -241,14 +260,12 @@ static int resolve_path(const char *dec, char *out)
     if (!realpath(full, real)) {
         if (errno == EACCES)
             return 403;
-        return leads_outside(full, 0) ? 403 : 404;
+        return leads_outside(full) ? 403 : 404;
     }
     /* Symlinks must not lead outside the root. */
-    size_t rl = strlen(g_root);
-    if (rl == 1)
-        rl = 0;                         /* root "/" */
     if (!inside_root(real))
         return 403;
+    size_t rl = strlen(g_root) == 1 ? 0 : strlen(g_root);
     /* Nor to a hidden file or directory inside it. */
     if (strstr(real + rl, "/."))
         return 404;
@@ -583,16 +600,6 @@ int main(int argc, char **argv)
     fprintf(stderr, "bserve: serving %s on port %s (BHTTP/1)\n", g_root, argv[argi + 1]);
 
     for (;;) {
-        /* Reap finished children; at the cap, block until one exits. A signal
-         * can interrupt waitpid, so keep going until there is a free slot. */
-        pid_t done;
-        while (g_nchild > 0) {
-            done = waitpid(-1, NULL, g_nchild >= MAX_CHILDREN ? 0 : WNOHANG);
-            if (done > 0)
-                forget_child(done);
-            else if (g_nchild < MAX_CHILDREN || (done < 0 && errno != EINTR))
-                break;
-        }
         struct sockaddr_storage ss;
         socklen_t sl = sizeof ss;
         int cfd = accept(lfd, (struct sockaddr *)&ss, &sl);
@@ -603,21 +610,16 @@ int main(int argc, char **argv)
                 usleep(100000);     /* out of descriptors: back off, don't spin */
             continue;
         }
+        /* Reap whatever has finished (never blocking, so one busy client
+         * cannot stall accept for everyone), then apply the caps. */
+        pid_t done;
+        while ((done = waitpid(-1, NULL, WNOHANG)) > 0)
+            forget_child(done);
         char addr[INET6_ADDRSTRLEN];
         peer_addr(&ss, addr, sizeof addr);
-        /* Children whose client just hung up may not be reaped yet: give
-         * them a moment so a client that closed its connections is not
-         * counted against itself. */
-        for (int tries = 0; count_client(addr) >= MAX_PER_CLIENT && tries < 20; tries++) {
-            while ((done = waitpid(-1, NULL, WNOHANG)) > 0)
-                forget_child(done);
-            if (count_client(addr) >= MAX_PER_CLIENT)
-                usleep(10000);
-        }
-        if (count_client(addr) >= MAX_PER_CLIENT) {
-            /* One address may not hold every slot. */
-            fprintf(stderr, "[bserve] %s already has %d connections; closing new one\n",
-                    addr, MAX_PER_CLIENT);
+        if (g_nchild >= MAX_CHILDREN || count_client(addr) >= MAX_PER_CLIENT) {
+            fprintf(stderr, "[bserve] connection from %s refused: %s\n", addr,
+                    g_nchild >= MAX_CHILDREN ? "server full" : "too many from this address");
             close(cfd);
             continue;
         }

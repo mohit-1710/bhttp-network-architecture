@@ -84,6 +84,11 @@ static int parse_url(const char *url, target *t)
     }
     if (!*host || strlen(host) >= sizeof t->host)
         return -1;
+    /* A host name or IPv4 address, or (inside brackets) an IPv6 address. */
+    const char *ok = auth[0] == '[' ? "0123456789abcdefABCDEF:.%" :
+                     "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789.-";
+    if (strspn(host, ok) != strlen(host))
+        return -1;
     strcpy(t->host, host);
     if (port) {
         if (!*port || strlen(port) > 5 || strspn(port, "0123456789") != strlen(port) ||
@@ -151,6 +156,7 @@ static int connect_to(const target *t)
     struct timeval tv = { g_timeout, 0 };
     setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
     setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv);   /* a server that never reads */
     return fd;
 }
 
@@ -368,8 +374,10 @@ static int read_response(int fd, uint32_t sid, int head, int show_headers)
         fprintf(stderr, "bcurl: response to HEAD does not end with its HEADERS frame\n");
         return -1;
     }
+    int fresh = 1;                      /* restart the deadline for this frame? */
     while (!end) {
-        bh_set_deadline(g_timeout);
+        if (fresh)
+            bh_set_deadline(g_timeout);
         if (bh_next_frame(fd, &f, g_trace) != 0) {
             fprintf(stderr, "bcurl: connection %s mid-response (body incomplete)\n",
                     closed_or_timed_out());
@@ -410,6 +418,9 @@ static int read_response(int fd, uint32_t sid, int head, int show_headers)
         }
         got += f.length;
         end = f.flags & BH_FLAG_END_STREAM;
+        /* Only a frame that carried bytes earns a new deadline, so a server
+         * cannot hold bcurl open with empty DATA frames. */
+        fresh = f.length > 0;
     }
     if (fflush(stdout) != 0) {
         fprintf(stderr, "bcurl: writing to stdout failed\n");

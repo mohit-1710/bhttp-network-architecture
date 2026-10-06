@@ -45,25 +45,24 @@ table code { white-space: nowrap; }
 <h1 class="title">BHTTP/1: a binary framing for HTTP</h1>
 <p class="subtitle">Specification, version 1</p>
 </header>
-<p>MUST, MUST NOT, SHOULD, RECOMMENDED and MAY are used as in RFC 2119
-and RFC 8174. Integers are unsigned and big-endian. Sizes are in
-bytes.</p>
+<p>MUST, MUST NOT, SHOULD, RECOMMENDED and MAY are as in RFC 2119 and
+8174. Integers are unsigned big-endian; sizes are in bytes.</p>
 <h2 id="connection">1. Connection</h2>
 <p>BHTTP/1 runs over one TCP connection (default port 9000). The server
 answers requests in order on the connection they came in on. A client
 sends all the requests of one run on one connection and MUST NOT open a
 second. If it closes early, the client reports an error rather than
 reconnecting. A client SHOULD wait for each response before sending the
-next request, but a server MUST also accept pipelined requests. It reads
-each request completely before answering it. A server MAY refuse a
-connection by closing it at once; otherwise it closes only after a
-connection error (§6), after a body it cannot finish (§4), when a
-request takes too long to arrive or the client stops taking response
-frames, or when no request has been in progress for a while (at least 10
-s RECOMMENDED; unknown frames do not count as activity). Unless a body
-fails or the client stops taking frames, it never closes with a fully
-received request unanswered, so a request with no response was not
-processed.</p>
+next request.</p>
+<p>A server MUST also accept pipelined requests. It reads each request
+completely before answering it. A server MAY refuse a connection by
+closing it at once; otherwise it closes only after a connection error
+(§6), after a body it cannot finish (§4), when a request takes too long
+to arrive or the client stops taking response frames, or when no request
+has been in progress for a while (at least 10 s RECOMMENDED; unknown
+frames do not count as activity). Unless a body fails or the client
+stops taking frames, it never closes with a fully received request
+unanswered, so a request with no response was not processed.</p>
 <h2 id="frame-header">2. Frame header</h2>
 <p>Every frame is an 8-byte header followed by Length bytes of
 payload.</p>
@@ -84,8 +83,8 @@ MUST ignore them.</li>
 at 1. Each request MUST use a higher ID than the one before (gaps are
 allowed), and the response carries the same ID. Stream 0 stands for the
 connection itself: in v1 it carries only unknown frames and the
-connection-error message of §6. A client never uses an ID above 16 777
-215; one with more requests stops and reports an error.</li>
+connection-error message of §6. IDs above 16 777 215 are never used; a
+client with more requests reports an error.</li>
 </ul>
 <h2 id="unknown-frame-types">3. Unknown frame types</h2>
 <p>A receiver that reads a frame of unknown type MUST skip it: read and
@@ -200,8 +199,8 @@ SHOULD be sent.</li>
 <li>A response has one <code>:status</code>, three ASCII digits from 200
 to 599, and no <code>:method</code> or <code>:path</code>. v1 has no 1xx
 responses.</li>
-<li>A block breaking any of these rules, using tags 11 to 255, or with a
-length running past the payload is malformed.</li>
+<li>A block breaking any rule here (SHOULDs aside), using tags 11 to
+255, or with a length past the payload is malformed.</li>
 </ul>
 <h2 id="server">6. Server</h2>
 <p>The server cuts <code>:path</code> at the first <code>?</code> or
@@ -213,8 +212,8 @@ response carries <code>content-type</code>, <code>content-length</code>,
 <code>200</code> and the file as DATA, an error a short
 <code>text/plain</code> body, and HEAD no DATA (its
 <code>content-length</code> is the file&#39;s size). The first matching row
-below decides. A segment is a piece of the decoded path between slashes;
-resolved means with symlinks followed.</p>
+below decides. Segments are the decoded path&#39;s parts between slashes;
+resolved means symlinks followed.</p>
 <table>
 <colgroup>
 <col style="width: 4%" />
@@ -273,13 +272,13 @@ included), a resolved dot component, or not a regular file</td>
 <p>These are stream errors: the response goes on the request&#39;s stream
 (after any request body is read and discarded) and the connection stays
 open. Connection errors, where the frame sequence can no longer be
-trusted, are: HEADERS on stream 0 or with an ID not higher than the
-last; DATA with no request open or on a different stream; or a new
-HEADERS before the open request&#39;s END_STREAM. After answering requests
-completed before the bad frame, the server sends the connection-error
-message on stream 0, an ordinary 400 response (§4, §5) whose body is the
-reason, and closes. On EOF inside a frame or an unfinished request, the
-server just closes.</p>
+trusted, are: HEADERS on stream 0 or with an ID not higher than every
+earlier HEADERS on the connection (answered or not); DATA with no
+request open or on a different stream; or a new HEADERS before the open
+request&#39;s END_STREAM. After answering requests completed before the bad
+frame, the server sends the connection-error message on stream 0, an
+ordinary 400 response (§4, §5) whose body is the reason, and closes. On
+EOF inside a frame or an unfinished request, the server just closes.</p>
 <h2 id="client">7. Client</h2>
 <p>The client matches responses to requests in order. A HEADERS frame on
 stream 0, at any point, starts a connection-error message; the client
@@ -295,11 +294,11 @@ unfinished; and a read timeout.</p>
 and a 31-bit Stream ID: 9 bytes. Its drafts used 8 bytes (a 16-bit
 Length in draft 04, 14 bits plus two reserved bits in draft 13) until
 draft 14 (2014) widened Length to 24 bits, letting a receiver opt in to
-larger frames. The 2^14 default stops one big frame delaying the others.
+larger frames. The 2¹⁴ default stops one big frame delaying the others.
 Flags are defined per frame type, so 8 bits are enough. The 31-bit
 Stream ID is a 32-bit word minus a reserved bit with no meaning (RFC
 9113 §4.1); both ends start streams (client odd, server even), giving
-the client 2^30 IDs and the server 2^30 − 1. BHTTP/1 uses 24 / 8 / 8 /
+the client 2³⁰ IDs and the server 2³⁰ − 1. BHTTP/1 uses 24 / 8 / 8 /
 24:</p>
 <ul>
 <li>Length 24. v1&#39;s sizes (16 KiB DATA recommended, header blocks at
@@ -315,18 +314,18 @@ agreement first (below).</li>
 streams, so it needs no odd/even split or reserved bit. The ID still
 matches each response to its request, exposes stale or misplaced frames,
 and leaves room for v2 multiplexing. At the 19 000 requests a second
-bserve manages on loopback, 2^24 IDs last 15 minutes of continuous
+bserve manages on loopback, 2²⁴ IDs last 15 minutes of continuous
 use.</li>
 </ul>
 <p>From HPACK (static and dynamic tables, Huffman coding, prefix-coded
 integers) BHTTP/1 takes two ideas: names from a fixed table (HPACK&#39;s
 &quot;literal with indexed name&quot;) and length-prefixed literals. It indexes
-names only, since most values here (paths, dates, lengths) change on
-every message.</p>
+names only, as values like paths and dates change on every message.</p>
 <p>With no preface, a misdirected HTTP/1.1 <code>GET /</code> reads as
 an unknown frame of Length 0x474554 and is skipped until the idle limit,
-a slow failure v1 accepts. To grow, a v2 client first sends a new frame
-type, which a v2 server acknowledges before its first response and a v1
-server skips.</p>
+a slow failure v1 accepts. To grow, a v2 client sends a new frame type,
+say HELLO, before a first request that is plain v1. A v2 server answers
+with its own HELLO before that response; a v1 server skips it, so a
+response with no HELLO before it means v1.</p>
 </body>
 </html>

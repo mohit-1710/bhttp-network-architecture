@@ -123,7 +123,7 @@ Ten common names (`:method`, `:path`, `:status`, `host`, `user-agent`, `accept`,
 | Client (Track 2) | `bcurl -v localhost:9000/index.html` builds the request frame, writes the body to stdout, hexdumps every frame with `-v`, exits 4 on 4xx and 5 on 5xx, and sends any extra paths on the same connection. |
 | Unknown frames | Both sides skip frame types they do not know, on any stream and between any two frames. `--grease` sends a type `0xFA` frame first, to check that the server skips it. |
 | Path safety | `..` gives 403. Dotfiles, FIFOs and other non-regular files give 404, even through a symlink. Symlinks must resolve inside the root, and a missing file behind an outside link is 403, not 404. |
-| Timeouts and caps | Idle and request deadlines, a per-frame deadline in each direction (see Run), 128 connections in all and 16 per client address. |
+| Timeouts and caps | Idle and request deadlines, a per-frame deadline in each direction (see Run), 128 connections in all and 32 per client address. |
 | Truncated bodies | If a file read fails mid-body the server drops the connection instead of sending END_STREAM, and the client checks `content-length` against the bytes received. |
 
 ---
@@ -154,7 +154,7 @@ Apple M5 Pro, loopback, release build (`make`); times are the middle of three ru
 | 10 000 requests over one connection, one at a time | 0.52 s, 19 000 requests/s (52 µs each) |
 | 200 MB file, 12 208 DATA frames | 0.095 s, 2.1 GB/s, byte-identical |
 | Framing overhead on a full DATA frame | 8 / 16 392 bytes = 0.05 % |
-| Tests (C programs against a separate Python implementation) | 104 passing on Ubuntu and macOS, and again under ASan and UBSan ([CI](.github/workflows/ci.yml)) |
+| Tests (C programs against a separate Python implementation) | 110 passing on Ubuntu and macOS, and again under ASan and UBSan ([CI](.github/workflows/ci.yml)) |
 | Header-block fuzzing (`make fuzz`, under ASan and UBSan) | 300 000 mutated blocks, no crashes |
 
 ---

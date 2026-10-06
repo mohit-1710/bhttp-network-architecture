@@ -434,14 +434,25 @@ def test_root_and_timeouts():
             request(s, 13, "/pipe")
             s.settimeout(3)
             check("FIFO in the root -> 404 at once, not a hang", recv_response(s, 13)[0] == 404)
+            os.symlink("loop-b", os.path.join(root, "loop-a"))
+            os.symlink("loop-a", os.path.join(root, "loop-b"))
+            request(s, 14, "/loop-a")
+            check("symlink loop inside the root -> 404", recv_response(s, 14)[0] == 404)
+            request(s, 15, "/x" + "/" * 1000)
+            check("missing path made of 1000 slashes -> 404, worker survives",
+                  recv_response(s, 15)[0] == 404)
+            request(s, 16, "/x/" * 300 + "y")
+            check("missing path with 300 segments -> 404", recv_response(s, 16)[0] == 404)
             s.settimeout(None)
             s.close()
 
-            # One client address may hold at most 16 connections.
-            held = [connect(port) for _ in range(16)]
+            # One client address may hold at most 32 connections.
+            held = [connect(port) for _ in range(32)]
             time.sleep(0.3)
             extra = connect(port)
-            check("17th connection from one address is closed at once", closed_by_peer(extra, wait=2))
+            t0 = time.monotonic()
+            check("33rd connection from one address is refused at once",
+                  closed_by_peer(extra, wait=2) and time.monotonic() - t0 < 1)
             extra.close()
             for c in held:
                 c.close()
@@ -549,6 +560,16 @@ class FakeServer:
         except OSError:
             pass
 
+    def empties(self, c, sid):
+        """Start a response, then send an empty DATA frame every 0.4 s, forever-ish."""
+        try:
+            c.sendall(frame(HEADERS, 0, sid, enc_headers([(":status", "200")])))
+            for _ in range(40):
+                c.sendall(frame(DATA, 0, sid, b""))
+                time.sleep(0.4)
+        except OSError:
+            pass
+
     def handle(self, c):
         try:
             while True:
@@ -560,6 +581,9 @@ class FakeServer:
                 path = h[":path"].split("?")[0]
                 if path == "/drip":
                     self.drip(c, sid)
+                    continue
+                if path == "/empties":
+                    self.empties(c, sid)
                     continue
                 self.routes.get(path, self.routes["*"])(c, sid)
         except (EOFError, OSError):
@@ -723,6 +747,17 @@ def test_client():
 
         r = bcurl("-X", "X1", f"{base}/ok")
         check("-X accepts any token", r.returncode == 0 and fs.requests[-1][":method"] == "X1")
+
+        t0 = time.monotonic()
+        r = bcurl("-t", "2", f"{base}/empties")
+        check("empty DATA frames do not reset bcurl's deadline",
+              r.returncode == 3 and time.monotonic() - t0 < 5)
+
+        r = bcurl("127.0.0.1:19101:80/x")
+        check("junk in the authority is a usage error", r.returncode == 1)
+
+        r = bcurl("user@127.0.0.1:19101/x")
+        check("user@host is a usage error", r.returncode == 1)
 
         r = bcurl("-t", "5x", f"{base}/ok")
         check("-t must be a whole number of seconds", r.returncode == 1)
