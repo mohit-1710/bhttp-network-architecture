@@ -1,11 +1,14 @@
 /*
- * fuzz_hb.c - mutation fuzzer for the header-block decoder and the -v
- * field printer. Build with sanitizers (make fuzz) so any out-of-bounds
- * access aborts. Deterministic: the same seed gives the same inputs.
+ * fuzz_hb.c - mutation fuzzer for both header-block decoders: bserve's
+ * (bproto.c) and bcurl's (cwire.c), which were written separately. Build
+ * with sanitizers (make fuzz) so any out-of-bounds access aborts. It also
+ * fails if the two decoders ever disagree on whether a block is valid.
+ * Deterministic: the same seed gives the same inputs.
  *
  *   usage: fuzz_hb [iterations]
  */
 #include "../src/bproto.h"
+#include "../src/cwire.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -56,14 +59,28 @@ int main(int argc, char **argv)
         uint8_t *exact = malloc(n ? n : 1);
         memcpy(exact, buf, n);
         bh_headers h;
-        if (bh_hb_decode(exact, n, &h) == 0) {
+        cw_headers c;
+        int a = bh_hb_decode(exact, n, &h) == 0;
+        int b = cw_hb_decode(exact, n, &c) == 0;
+        if (a != b) {
+            fprintf(stderr, "fuzz_hb: decoders disagree on input %ld (bserve %s, bcurl %s):",
+                    i, a ? "valid" : "malformed", b ? "valid" : "malformed");
+            for (size_t k = 0; k < n; k++)
+                fprintf(stderr, " %02x", exact[k]);
+            fputc('\n', stderr);
+            return 1;
+        }
+        if (a) {
             ok++;
             bh_headers_free(&h);
+            cw_headers_free(&c);
         }
         bh_trace_fields(null, '<', exact, n);
+        cw_trace_fields(null, '<', exact, n);
         free(exact);
     }
-    printf("fuzz_hb: %ld inputs, %ld decoded as valid, no crashes\n", iters, ok);
+    printf("fuzz_hb: %ld inputs, %ld valid, both decoders agreed on every one, no crashes\n",
+           iters, ok);
     bh_buf_free(&req);
     bh_buf_free(&res);
     fclose(null);

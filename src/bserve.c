@@ -162,6 +162,49 @@ static int decode_path(const char *path, char *dec, size_t decsz)
     return 0;
 }
 
+static int g_rootfd = -1;            /* the document root, opened once at start */
+
+/* Open an already-resolved path one component at a time with openat(),
+ * starting from the root directory and refusing a symlink at every step.
+ * realpath() has resolved every link, so a symlink found here means
+ * something was swapped in after the check; the open fails (ELOOP) instead
+ * of following it out of the root. */
+static int open_beneath(const char *real)
+{
+    size_t rl = strlen(g_root) == 1 ? 0 : strlen(g_root);
+    const char *rel = real + rl;
+    while (*rel == '/')
+        rel++;
+    int dir = dup(g_rootfd);
+    if (dir < 0)
+        return -1;
+    char part[NAME_MAX + 1];
+    while (*rel) {
+        size_t n = strcspn(rel, "/");
+        if (n > NAME_MAX) {
+            close(dir);
+            errno = ENAMETOOLONG;
+            return -1;
+        }
+        memcpy(part, rel, n);
+        part[n] = '\0';
+        rel += n;
+        while (*rel == '/')
+            rel++;
+        int flags = *rel ? O_RDONLY | O_DIRECTORY | O_NOFOLLOW
+                         : O_RDONLY | O_NOFOLLOW | O_NONBLOCK;   /* no FIFO stall */
+        int fd = openat(dir, part, flags);
+        int e = errno;
+        close(dir);
+        if (fd < 0) {
+            errno = e;
+            return -1;
+        }
+        dir = fd;
+    }
+    return dir;
+}
+
 static int inside_root(const char *real)
 {
     size_t rl = strlen(g_root);
@@ -314,12 +357,9 @@ static int handle_request(int fd, uint32_t sid, const uint8_t *block, size_t len
         goto out;
     }
 
-    /* realpath() already resolved every link. O_NOFOLLOW stops the last
-     * component being swapped for a symlink since then (a swapped parent
-     * directory is not caught; that needs write access to the root),
-     * O_NONBLOCK stops a FIFO from blocking us, and fstat checks what we
-     * actually opened. */
-    int ffd = open(file, O_RDONLY | O_NOFOLLOW | O_NONBLOCK);
+    /* Opened from the root descriptor component by component (see
+     * open_beneath), and fstat checks what we actually got. */
+    int ffd = open_beneath(file);
     struct stat st;
     if (ffd < 0 || fstat(ffd, &st) != 0 || !S_ISREG(st.st_mode)) {
         int e = ffd < 0 ? errno : ENOENT;
@@ -584,8 +624,9 @@ int main(int argc, char **argv)
         return 1;
     }
     struct stat st;
-    if (stat(g_root, &st) != 0 || !S_ISDIR(st.st_mode)) {
-        fprintf(stderr, "bserve: root '%s' is not a directory\n", g_root);
+    if (stat(g_root, &st) != 0 || !S_ISDIR(st.st_mode) ||
+        (g_rootfd = open(g_root, O_RDONLY | O_DIRECTORY)) < 0) {
+        fprintf(stderr, "bserve: root '%s' is not a readable directory\n", g_root);
         return 1;
     }
 
