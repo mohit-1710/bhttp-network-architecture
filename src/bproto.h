@@ -1,5 +1,5 @@
 /*
- * bproto.h - shared framing for BHTTP/1 (see SPEC.md).
+ * bproto.h - bserve's BHTTP/1 framing and header-block code (see SPEC.md).
  *
  * Frame header, 8 bytes, network byte order:
  *

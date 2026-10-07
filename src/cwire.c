@@ -1,4 +1,4 @@
-/* cwire.c - bcurl's BHTTP/1 codec. Written from SPEC.md, not from bproto.c. */
+/* cwire.c - bcurl's BHTTP/1 codec (see cwire.h). */
 #include "cwire.h"
 
 #include <errno.h>

@@ -1,4 +1,4 @@
-# Annotated hexdumps: a GET, a 404, a skipped frame and a 400
+# Annotated hexdumps
 
 Captured from `./bcurl` against `./bserve ./www 9000`. The request asks for `/hello.txt`, a 20-byte file containing `Hello, binary HTTP!\n`. I added one header that is not in the static table (`-H 'x-trace-id: 7f3a'`) so the dump also shows a literal name:
 

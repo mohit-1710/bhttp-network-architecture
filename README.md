@@ -13,7 +13,7 @@
 
 ## Architecture
 
-bserve and bcurl share no source code: bserve uses `src/bproto.c`, bcurl has its own codec in `src/cwire.c`, both written from [SPEC.md](SPEC.md). The only thing that crosses between them is the spec and the bytes on the wire. The purple boxes are where most of my design time went.
+bserve and bcurl share no source code: bserve uses `src/bproto.c` and bcurl has its own codec in `src/cwire.c`, both written from [SPEC.md](SPEC.md). The purple boxes are where most of my design time went.
 
 ```mermaid
 flowchart LR
@@ -122,7 +122,7 @@ Ten names have one-byte tags (table in SPEC §5); everything else is length-pref
 | Server (Track 1) | `bserve ./www 9000` reads binary frames, maps `:path` under the root, answers `200` with the file as DATA frames, or 400, 403, 404 or 405 as listed in SPEC §6. |
 | Client (Track 2) | `bcurl -v localhost:9000/index.html` builds the request frame, writes the body to stdout, hexdumps every frame with `-v`, exits non-zero on 4xx and 5xx, and sends any extra paths on the same connection. |
 | Unknown frames | Both sides skip frame types they do not know, on any stream and between any two frames. `--grease` sends a type `0xFA` frame first, to check that the server skips it. |
-| Path safety | See Server path policy below. Files are opened one path component at a time from a descriptor for the root, with `O_NOFOLLOW` at every step, so a directory swapped for a symlink mid-request cannot lead outside. |
+| Path safety | Files are opened one path component at a time from a descriptor for the root, with `O_NOFOLLOW` at every step, so a directory swapped for a symlink mid-request cannot lead outside. |
 | Timeouts and caps | bserve drops a connection that sits idle, sends a request too slowly or reads a frame too slowly for longer than `-t` (default 30 s). It serves 128 connections at once, 32 per client address. |
 | Truncated bodies | If a file read fails mid-body the server drops the connection instead of sending END_STREAM, and the client checks `content-length` against the bytes received. |
 
@@ -172,7 +172,7 @@ Apple M5 Pro, loopback, release build (`make`); times are the middle of three ru
 | 200 MB file, 12 208 DATA frames | 0.095 s, 2.1 GB/s, byte-identical |
 | Framing overhead on a full DATA frame | 8 / 16 392 bytes = 0.05 % |
 | Tests (C programs against a separate Python implementation) | 116 passing on Ubuntu and macOS, and again under ASan and UBSan ([CI](.github/workflows/ci.yml)) |
-| Header-block fuzzing (`make fuzz`, under ASan and UBSan) | 300 000 mutated blocks through both decoders; no crashes, and bserve's and bcurl's separately written codecs agreed on every block |
+| Header-block fuzzing (`make fuzz`, under ASan and UBSan) | 300 000 mutated blocks; no crashes, and both decoders gave the same accept/reject result on every block |
 
 ---
 
@@ -225,7 +225,7 @@ SPEC.md                 the protocol (docs/SPEC.pdf: the same text on two pages;
 HEXDUMP.md              annotated captures: GET, 404, skipped frame, 400
 src/bproto.[ch]         bserve's frame and header-block code, deadlines, -v hexdump
 src/bserve.c            Track 1, the server
-src/cwire.[ch]          bcurl's own frame and header-block code (shares nothing with bproto)
+src/cwire.[ch]          bcurl's frame and header-block code
 src/bcurl.c             Track 2, the client
 tests/interop.py        Python implementation of the spec + the tests
 tests/fuzz_hb.c         differential fuzzer: both header-block decoders must agree (make fuzz)

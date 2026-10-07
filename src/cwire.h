@@ -1,9 +1,8 @@
 /*
  * cwire.h - bcurl's own BHTTP/1 wire code, written from SPEC.md.
  *
- * bserve uses bproto.[ch]; bcurl uses only this file, so the two programs
- * share the spec and nothing else. A misreading in one codec cannot hide
- * behind the same misreading in the other.
+ * Kept separate from bproto.[ch] on purpose; tests/fuzz_hb.c checks the
+ * two decoders against each other.
  */
 #ifndef CWIRE_H
 #define CWIRE_H

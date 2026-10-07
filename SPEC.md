@@ -85,7 +85,7 @@ The server cuts `:path` at the first `?` or `#`, decodes `%XX` escapes and looks
 | 404 | there is no regular file to serve |
 | 500 | opening or reading the file failed in some other way |
 
-How symbolic links and dotfiles are treated is server policy, not protocol; bserve's rules are in its README.
+Treatment of symbolic links and dotfiles is left to the server.
 
 These are stream errors: the response goes on the request's stream (after any body is discarded) and the connection stays open. Connection errors, which win over stream errors, mean the frame sequence can no longer be trusted:
 
