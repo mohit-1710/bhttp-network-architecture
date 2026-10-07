@@ -517,6 +517,11 @@ int main(int argc, char **argv)
         fprintf(stderr, "bcurl: stdout is closed\n");
         return EX_PROTO;
     }
+    /* The same for stdin and stderr: park /dev/null there, or -v output and
+     * error messages could land in the socket. */
+    for (int std = 0; std <= 2; std += 2)
+        if (fcntl(std, F_GETFD) < 0 && open("/dev/null", O_RDWR) != std)
+            return EX_PROTO;
     signal(SIGPIPE, SIG_IGN);
     int fd = connect_to(&base);
     if (fd < 0)

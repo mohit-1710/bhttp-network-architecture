@@ -745,6 +745,10 @@ def test_client():
         r = bcurl(f"{base}/" + "a" * 1023)
         check("1024-byte path is accepted", r.returncode == 4 and len(fs.requests[-1][":path"]) == 1024)
 
+        r = subprocess.run(f"{BCURL} -v {base}/ok 2>&-", shell=True, capture_output=True, timeout=10)
+        check("-v with stderr closed: trace does not leak into the connection",
+              r.returncode == 0 and r.stdout == b"hello world\n")
+
         r = bcurl(f"{base}/ok#section")
         check("#fragment is not sent", r.returncode == 0 and fs.requests[-1][":path"] == "/ok")
 
@@ -842,6 +846,13 @@ def test_end_to_end():
         check("404 -> exit 4", r.returncode == 4)
         r = bcurl("-I", f"localhost:{port}/%zz")
         check("HEAD that bserve answers with a header-only 400 -> exit 4", r.returncode == 4, r.stderr)
+        srv2 = subprocess.Popen(f"exec {BSERVE} {WWW} {port + 1} 2>&-", shell=True)
+        try:
+            connect(port + 1).close()
+            r = bcurl(f"localhost:{port + 1}/hi.txt")
+            check("bserve with stderr closed still serves cleanly", r.returncode == 0 and r.stdout == b"hi\n")
+        finally:
+            srv2.terminate(); srv2.wait()
         r = bcurl("-I", f"localhost:{port}/missing")
         check("HEAD for a missing file -> exit 4", r.returncode == 4, r.stderr)
     finally:

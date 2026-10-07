@@ -139,8 +139,8 @@ SPEC §6 leaves file lookup to the server. bserve checks a request in this order
 | 3 | 403 | a path segment equal to `..` |
 | 4 | 404 | any other segment starting with a dot (`.`, `.env`, `.git`) |
 | 5 | 403 | the path, with symlinks followed, leads outside the root; for a missing file, the part that does exist already does (so a 404 never confirms a file outside) |
-| 6 | 404 | missing, a symlink loop, a resolved dot component, or not a regular file (FIFOs, sockets, a directory named `index.html`) |
-| 7 | 403 | the file exists but may not be read |
+| 6 | 404 | missing (including under a directory that cannot be searched), a symlink loop or a chain of more than 8 dangling links, a resolved dot component, or not a regular file (FIFOs, sockets, a directory named `index.html`) |
+| 7 | 403 | the file itself exists but may not be read |
 | 8 | 500 | any other open or read failure |
 
 ---
@@ -171,7 +171,7 @@ Apple M5 Pro, loopback, release build (`make`); times are the middle of three ru
 | 10 000 requests over one connection, one at a time | 0.52 s, 19 000 requests/s (52 µs each) |
 | 200 MB file, 12 208 DATA frames | 0.095 s, 2.1 GB/s, byte-identical |
 | Framing overhead on a full DATA frame | 8 / 16 392 bytes = 0.05 % |
-| Tests (C programs against a separate Python implementation) | 116 passing on Ubuntu and macOS, and again under ASan and UBSan ([CI](.github/workflows/ci.yml)) |
+| Tests (C programs against a separate Python implementation) | 118 passing on Ubuntu and macOS, and again under ASan and UBSan ([CI](.github/workflows/ci.yml)) |
 | Header-block fuzzing (`make fuzz`, under ASan and UBSan) | 300 000 mutated blocks; no crashes, and both decoders gave the same accept/reject result on every block |
 
 ---

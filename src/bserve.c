@@ -603,6 +603,12 @@ static void peer_name(const struct sockaddr_storage *ss)
 
 int main(int argc, char **argv)
 {
+    /* With fd 0, 1 or 2 closed, accept() could hand out that number and
+     * log lines would go into a client's connection. */
+    for (int std = 0; std <= 2; std++)
+        if (fcntl(std, F_GETFD) < 0 && open("/dev/null", O_RDWR) != std)
+            return 1;
+
     int argi = 1;
     for (; argi < argc && argv[argi][0] == '-'; argi++) {
         if (strcmp(argv[argi], "-v") == 0) {
