@@ -9,10 +9,10 @@ MUST, SHOULD and MAY are as in RFC 2119 and 8174. Integers are unsigned and big-
 
 BHTTP/1 runs over one TCP connection, by default on port 9000.
 
-* A client sends all requests of one run on it and MUST NOT open a second; if it closes early, the client reports an error.
+* A client sends all requests of one run on it and MUST NOT open a second; if it closes early, that is an error.
 * A client SHOULD wait for each response, but a server MUST accept pipelined requests and answer them in order.
 * A server MAY refuse a connection by closing it before reading anything. Otherwise it closes only after a connection error (§6), a body it cannot finish (§4), or a time limit (idle, slow request, or a client not taking frames). Each limit SHOULD be at least 10 s; unknown frames are not activity.
-* Unless a body fails or the client stalls, a server never closes with a received request unanswered, so a request with no response was not processed.
+* Unless a body fails or the client stalls, a server never closes with a received request unanswered: no response means not processed.
 
 ## 2. Frame header
 
@@ -37,7 +37,7 @@ Example: `00 00 31 01 01 00 00 01` is HEADERS, 49 payload bytes, END_STREAM, str
 
 ## 3. Unknown frame types
 
-A receiver that meets a frame of unknown type MUST skip it: read and discard exactly Length bytes, then carry on with the next frame. It MUST NOT reply, close the connection or change any request state because of it, whatever its stream or flags; END_STREAM on an unknown frame ends nothing. This holds anywhere, even inside a message, and overrides every other rule. Types `0xF0`–`0xFF` will never be assigned, so senders can use them to test that peers skip. HTTP/2 has the same rule outside its header blocks (RFC 9113 §4.1).
+A receiver that meets a frame of unknown type MUST skip it: read and discard exactly Length bytes, then carry on with the next frame. It MUST NOT reply, close the connection or change any request state because of it, whatever its stream or flags; END_STREAM on an unknown frame ends nothing. This holds anywhere, even inside a message, and overrides every other rule (the idle limit of §1 still runs). Types `0xF0`–`0xFF` will never be assigned, so senders can use them to test that peers skip. HTTP/2 has the same rule outside its header blocks (RFC 9113 §4.1).
 
 ## 4. Messages
 
@@ -45,12 +45,12 @@ A request is one HEADERS frame, then zero or more DATA frames on the same stream
 
 * A header block fits in one HEADERS frame of at most 65 535 bytes; receivers MUST accept any such block.
 * DATA frames SHOULD be at most 16 384 bytes; receivers MUST accept any Length.
-* A response to HEAD carries no DATA, unless it is a 400 (a server that cannot decode the block cannot know the method). Any other response with `content-length` MUST carry exactly that many DATA bytes.
+* A response to HEAD carries no DATA, except that a 400 MAY carry its body (a server that cannot decode the block cannot know the method); a HEAD response's `content-length` is not checked. Any other response with `content-length` MUST carry exactly that many DATA bytes. In a request, only its syntax is checked.
 * A sender that cannot finish a body MUST close the connection without END_STREAM, so the cut is visible.
 
 ## 5. Header block
 
-A HEADERS payload is a list of fields; the frame's Length marks its end. Here `tag` is one byte and `len` is one or two.
+A HEADERS payload is a list of fields ending at the frame's Length. `tag` is one byte; `len` is one or two.
 
 ```
 field  = tag [name] value        ; name only when tag = 0
@@ -68,14 +68,14 @@ Tag 0 means a literal name follows. Tags 1 to 10 are the names of a plain GET ex
 
 * Literal names are lowercase HTTP token characters (RFC 9110 §5.6.2). `:` is not one, so pseudo-headers are sent by tag only. Senders MUST use the tag for a table name; receivers also accept the other table names as literals.
 * Values may hold any byte except NUL, CR and LF. `content-length` is 1 to 18 digits, read as a number. Senders SHOULD use the shortest `len`; receivers accept both forms.
-* Pseudo-headers come first. `:method`, `:path`, `:status`, `host` and `content-length` appear at most once.
-* A request has one `:method` (a case-sensitive token), one `:path` (starting with `/`, at most 1024 bytes), no `:status`, and SHOULD have `host`.
-* A response has one `:status` from 200 to 599 and no `:method` or `:path`.
-* Breaking any rule above other than a SHOULD or the senders' duty to use tags, using tags 11 to 255, or running past the payload makes a block malformed.
+* Pseudo-headers come first. `:method`, `:path`, `:status`, `host` and `content-length` appear once at most (tag or literal).
+* A request has one `:method` (a case-sensitive token), one `:path` (`/` first, at most 1024 bytes), no `:status`, and SHOULD have `host`.
+* A response has one `:status`, three ASCII digits from 200 to 599, and no `:method` or `:path`.
+* A block is malformed if it breaks a rule above (other than a SHOULD or the duty to use tags), uses tags 11 to 255, or overruns its payload.
 
 ## 6. Server
 
-The server cuts `:path` at the first `?` or `#`, decodes `%XX` escapes and looks the path up under its document root; a directory, or a path ending in `/`, means its `index.html`. Every response carries `content-type`, `content-length`, `server` and `date`. A found file gets `200` and the file as DATA, an error gets a short text body, and HEAD gets the headers only. The first matching row decides:
+The server cuts `:path` at the first `?` or `#`, decodes `%XX` escapes and looks the path up under its document root; a directory, or a path ending in `/`, means its `index.html`. Every response carries `content-type`, `content-length`, `server` and `date`. A found file gets `200` and the file as DATA, an error a short text body, HEAD the headers only. The first matching row decides:
 
 | status | when |
 |----|------------------------------------------------------------|
@@ -100,17 +100,15 @@ The server answers requests completed before the bad frame, sends a 400 response
 The client matches responses to its requests in order. A HEADERS frame on stream 0, at any point, starts a connection-error message: the client reads it, reports the reason and stops. Otherwise it closes on a protocol error:
 
 * a HEADERS or DATA frame for any stream but the oldest unanswered request;
-* DATA before HEADERS or after END_STREAM, or a second HEADERS in one response;
-* DATA in a response to HEAD, unless the status is 400;
-* a malformed or oversized response block, or a `content-length` mismatch;
-* EOF in the middle of a response, or a read timeout.
+* DATA before HEADERS or after END_STREAM, a second HEADERS, or DATA in a HEAD response other than a 400;
+* a malformed or oversized response block, a `content-length` mismatch, EOF mid-response, or a read timeout.
 
 ## 8. Design notes
 
 HTTP/2's frame header is 9 bytes: Length 24, Type 8, Flags 8, a reserved bit and a 31-bit Stream ID. Its drafts used 8 bytes, like BHTTP/1, until draft 14 (2014) widened Length from 14 to 24 bits so a receiver could opt in to larger frames. The default stayed 2¹⁴ so one large frame cannot hold up other streams. Flags are defined per frame type, so 8 bits suffice. The Stream ID is a 32-bit word minus the reserved bit, split between client (odd) and server (even). BHTTP/1 uses 24 / 8 / 8 / 24:
 
-* Length 24. v1's own sizes fit in 16 bits; the third byte allows larger frames later. The width can never change, because §3's skipping depends on every version reading Length the same way.
+* Length 24. v1 senders keep frames small, but receivers already accept any Length, so larger frames need no new header. The width can never change: §3's skipping needs every version to read Length alike.
 * Type 8 and Flags 8. Whole bytes need no masking, and the four fields fill two 32-bit words exactly. New frame types are safe for v1 peers (§3); a new flag or tag is not, so a v2 negotiates those first.
 * Stream ID 24. v1 answers in order and the server never opens streams, so there is no odd/even split. The ID matches responses to requests and exposes stale frames. At the 19 000 requests a second bserve manages on loopback, 2²⁴ IDs last about 15 minutes.
 
-Like HPACK, BHTTP/1 indexes common names in one byte and sends the rest as length-prefixed literals, without HPACK's dynamic table, Huffman coding or indexed values. With no preface, a stray HTTP/1.1 `GET /` reads as an unknown frame (Length 0x474554) and is skipped until the idle limit. For v2, a client sends a new HELLO frame type with a plain-v1 first request; a v2 server answers it before responding, a v1 server skips it.
+Like HPACK, common names get one-byte tags and the rest is length-prefixed, without a dynamic table or Huffman coding. A stray HTTP/1.1 `GET /` reads as an unknown frame of Length 0x474554 and waits out the idle limit. For v2, a client sends a new HELLO frame with a plain-v1 first request; only a v2 server answers it.

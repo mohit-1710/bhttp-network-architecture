@@ -430,9 +430,9 @@ static int read_response(int fd, uint32_t sid, int head, int show_headers)
         fprintf(stderr, "bcurl: writing to stdout failed\n");
         return -1;
     }
-    /* A HEAD response's content-length describes the body it did not send;
-     * only a 400 that actually carried DATA is checked against it. */
-    if ((!head || got > 0) && want >= 0 && got != want) {
+    /* A HEAD response's content-length describes a body that was not
+     * sent, so it is not checked (SPEC §4). */
+    if (!head && want >= 0 && got != want) {
         fprintf(stderr, "bcurl: body is %lld bytes but content-length said %lld\n", got, want);
         return -1;
     }

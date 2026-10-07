@@ -55,7 +55,7 @@ bcurl numbers its requests 1, 2, 3 on a single connection. A 404 or a malformed 
 ```mermaid
 sequenceDiagram
     autonumber
-    participant C as bcurl
+    participant C as client (bcurl; a test peer sends the bad frames)
     participant S as bserve
 
     C->>S: UNKNOWN type 0xFA, stream 0 (--grease)
