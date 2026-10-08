@@ -100,10 +100,11 @@ def recv_response(sock, sid):
     assert t == HEADERS and s == sid, (t, s)
     hdrs, body = dec_headers(p), b""
     while not fl & END_STREAM:
-        t, fl, s, p = recv_frame(sock)
+        t, next_flags, s, p = recv_frame(sock)
         if t not in (DATA, HEADERS):
             continue
         assert t == DATA and s == sid
+        fl = next_flags
         body += p
     return int(hdrs[":status"]), hdrs, body
 
@@ -146,6 +147,30 @@ def connect(port):
         except OSError:
             time.sleep(0.05)
     raise RuntimeError("bserve did not start")
+
+def test_python_peer():
+    print("Python peer framing")
+    reader, writer = socket.socketpair()
+    try:
+        reader.settimeout(2)
+        writer.sendall(
+            frame(HEADERS, 0, 1, enc_headers([(":status", "200"), ("content-length", "6")])) +
+            frame(DATA, 0, 1, b"abc") +
+            frame(0xFA, END_STREAM | 0x80, 0, b"future") +
+            frame(DATA, END_STREAM, 1, b"def") +
+            frame(HEADERS, END_STREAM, 2, enc_headers([(":status", "204"), ("content-length", "0")]))
+        )
+        status, _, body = recv_response(reader, 1)
+        check("Python peer ignores END_STREAM on an unknown frame inside a response",
+              status == 200 and body == b"abcdef")
+        kind, flags, sid, block = recv_frame(reader)
+        check("Python peer consumes the full response before the next stream",
+              kind == HEADERS and flags & END_STREAM and sid == 2 and
+              dec_headers(block).get(":status") == "204")
+    finally:
+        reader.close()
+        writer.close()
+
 
 # ------------------------------------------- python client -> bserve -----
 
@@ -312,6 +337,25 @@ def test_server():
         s.shutdown(socket.SHUT_WR)
         check("truncated frame then EOF -> server closes", closed_by_peer(s))
         s.close()
+
+        # EOF wins over a sequence error when that frame's payload is incomplete.
+        open_request = frame(HEADERS, 0, 1,
+                             enc_headers([(":method", "GET"), (":path", "/hi.txt")]))
+        truncated_sequences = [
+            ("truncated stray DATA", frame(DATA, END_STREAM, 7, b"abcd")[:-2]),
+            ("truncated new HEADERS during a request",
+             open_request + frame(HEADERS, END_STREAM, 2, b"abcd")[:-2]),
+            ("truncated DATA on the wrong stream",
+             open_request + frame(DATA, END_STREAM, 2, b"abcd")[:-2]),
+        ]
+        for label, wire in truncated_sequences:
+            s = connect(port)
+            try:
+                s.sendall(wire)
+                s.shutdown(socket.SHUT_WR)
+                check(f"{label} then EOF -> close without a 400", closed_by_peer(s))
+            finally:
+                s.close()
 
         # Large file spans many DATA frames.
         big = os.path.join(WWW, "big.bin")
@@ -664,6 +708,12 @@ def test_client():
         "/head400": raw(lambda sid: frame(HEADERS, 0, sid, enc_headers([(":status", "400"),
                                                                         ("content-length", "4")])) +
                         frame(DATA, END_STREAM, sid, b"bad\n")),
+        "/head400-short-length": raw(lambda sid: frame(HEADERS, 0, sid,
+            enc_headers([(":status", "400"), ("content-length", "1")])) +
+            frame(DATA, END_STREAM, sid, b"bad\n")),
+        "/head400-long-length": raw(lambda sid: frame(HEADERS, 0, sid,
+            enc_headers([(":status", "400"), ("content-length", "10")])) +
+            frame(DATA, END_STREAM, sid, b"bad\n")),
         "/early": raw(lambda sid: frame(HEADERS, END_STREAM, sid, enc_headers([(":status", "103")]))),
         "*": resp(404, b"nope\n"),
     })
@@ -781,6 +831,14 @@ def test_client():
         r = bcurl("-I", f"{base}/head400")
         check("a 400 with a body is accepted even for HEAD -> exit 4", r.returncode == 4)
 
+        for route in ("head400-short-length", "head400-long-length"):
+            r = bcurl("-I", f"{base}/{route}")
+            check(f"HEAD 400 ignores {route} and prints its body -> exit 4",
+                  r.returncode == 4 and r.stdout.endswith(b"bad\n"), r.stderr)
+        r = bcurl(f"{base}/head400-short-length")
+        check("GET still rejects a 400 body longer than content-length",
+              r.returncode == 3 and r.stdout == b"", r.stderr)
+
         r = bcurl("-t", "5x", f"{base}/ok")
         check("-t must be a whole number of seconds", r.returncode == 1)
 
@@ -863,6 +921,7 @@ if __name__ == "__main__":
     for exe in (BSERVE, BCURL):
         if not os.access(exe, os.X_OK):
             sys.exit(f"{exe} not built; run `make` first")
+    test_python_peer()
     test_server()
     test_root_and_timeouts()
     test_client()

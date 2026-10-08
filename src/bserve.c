@@ -440,7 +440,8 @@ static void serve_connection(int fd)
             break;
         }
         if (f.type == BH_DATA) {
-            bh_read_payload(fd, &f, NULL, g_trace);
+            if (bh_read_payload(fd, &f, NULL, g_trace) != 0)
+                break;
             connection_error(fd, "DATA frame outside of a request");
             break;
         }
@@ -474,8 +475,8 @@ static void serve_connection(int fd)
                 break;
             }
             if (d.type != BH_DATA || d.stream != f.stream) {
-                bh_read_payload(fd, &d, NULL, g_trace);
-                connection_error(fd, "expected DATA for the open request");
+                if (bh_read_payload(fd, &d, NULL, g_trace) == 0)
+                    connection_error(fd, "expected DATA for the open request");
                 bad = -1;
                 break;
             }

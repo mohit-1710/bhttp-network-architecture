@@ -395,8 +395,8 @@ static int read_response(int fd, uint32_t sid, int head, int show_headers)
             fprintf(stderr, "bcurl: expected DATA on stream %u\n", sid);
             return -1;
         }
-        /* Stop before writing anything past content-length. */
-        if (want >= 0 && got + f.length > want) {
+        /* HEAD's length describes an unsent body, even when a 400 carries DATA. */
+        if (!head && want >= 0 && got + f.length > want) {
             fprintf(stderr, "bcurl: body is longer than content-length %lld\n", want);
             return -1;
         }
