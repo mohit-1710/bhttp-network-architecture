@@ -105,7 +105,7 @@ The client matches responses to its requests in order. A HEADERS frame on stream
 
 ## 8. Design notes
 
-HTTP/2's frame header is 9 bytes: Length 24, Type 8, Flags 8, a reserved bit and a 31-bit Stream ID. Its drafts used 8 bytes, like BHTTP/1, until draft 14 (2014) widened Length from 14 to 24 bits so a receiver could opt in to larger frames. The default stayed 2¹⁴ so one large frame cannot hold up other streams. Flags are defined per frame type, so 8 bits suffice. The Stream ID is a 32-bit word minus the reserved bit, split between client (odd) and server (even). BHTTP/1 uses 24 / 8 / 8 / 24:
+HTTP/2's frame header is 9 bytes: Length 24, Type 8, Flags 8, a reserved bit and a 31-bit Stream ID. Its drafts used 8 bytes, like BHTTP/1, until draft 14 (2014) widened Length from 14 to 24 bits so a receiver could opt in to larger frames. The new default was 2¹⁴ so one large frame cannot hold up other streams. Flags are defined per frame type, so 8 bits suffice. The Stream ID is a 32-bit word minus the reserved bit, split between client (odd) and server (even). BHTTP/1 uses 24 / 8 / 8 / 24:
 
 * Length 24. v1 senders keep frames small, but receivers already accept any Length, so larger frames need no new header. The width can never change: §3's skipping needs every version to read Length alike.
 * Type 8 and Flags 8. Whole bytes need no masking, and the four fields fill two 32-bit words exactly. New frame types are safe for v1 peers (§3); a new flag or tag is not, so a v2 negotiates those first.

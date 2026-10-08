@@ -276,7 +276,7 @@ timeout.</li>
 <p>HTTP/2&#39;s frame header is 9 bytes: Length 24, Type 8, Flags 8, a
 reserved bit and a 31-bit Stream ID. Its drafts used 8 bytes, like
 BHTTP/1, until draft 14 (2014) widened Length from 14 to 24 bits so a
-receiver could opt in to larger frames. The default stayed 2¹⁴ so one
+receiver could opt in to larger frames. The new default was 2¹⁴ so one
 large frame cannot hold up other streams. Flags are defined per frame
 type, so 8 bits suffice. The Stream ID is a 32-bit word minus the
 reserved bit, split between client (odd) and server (even). BHTTP/1 uses

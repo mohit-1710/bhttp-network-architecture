@@ -154,7 +154,7 @@ SPEC §6 leaves file lookup to the server. bserve checks a request in this order
 | Stream ID | 24 bits, client counts 1, 2, 3 | none at all (no way to spot a stale frame); odd/even split (no server-started streams in v1) |
 | Header names | 10-entry static table + literals | HPACK's dynamic table and Huffman coding: the Huffman code table alone has 257 entries, for a few bytes saved on a 57-byte request |
 | String lengths | 1 byte below 128, else 2 bytes with the top bit set | fixed 2-byte lengths (a byte wasted on almost every field); HPACK prefix integers |
-| End of body | END_STREAM, checked against `content-length` | either alone: without END_STREAM a sender cannot stream a body of unknown size, and without the length check a cut-off body looks complete |
+| End of body | END_STREAM, checked against `content-length` | either alone: without END_STREAM a sender cannot stream a body of unknown size, and without the length check an early END_STREAM can make a short body look complete |
 | Version 2 | new frame types, negotiated by a frame v1 skips | a version byte in every header (a byte per frame that v1 never uses); a connection preface (extra bytes on every connection, and v1 peers could not tell one from a stray request) |
 
 SPEC §8 has the longer argument, including HTTP/2's own 8-byte drafts.
@@ -171,7 +171,7 @@ Apple M5 Pro, loopback, release build (`make`); times are the middle of three ru
 | 10 000 requests over one connection, one at a time | 0.52 s, 19 000 requests/s (52 µs each) |
 | 200 MB file, 12 208 DATA frames | 0.095 s, 2.1 GB/s, byte-identical |
 | Framing overhead on a full DATA frame | 8 / 16 392 bytes = 0.05 % |
-| Tests (C programs against a separate Python implementation) | 118 passing on Ubuntu and macOS, and again under ASan and UBSan ([CI](.github/workflows/ci.yml)) |
+| Tests (C programs against a separate Python implementation) | 126 passing on Ubuntu and macOS, and again under ASan and UBSan ([CI](.github/workflows/ci.yml)) |
 | Header-block fuzzing (`make fuzz`, under ASan and UBSan) | 300 000 mutated blocks; no crashes, and both decoders gave the same accept/reject result on every block |
 
 ---
@@ -203,7 +203,7 @@ bcurl exits with 0 when every status is below 400, 4 for a 4xx, 5 for a 5xx, 3 f
 
 ## Tests
 
-[tests/interop.py](tests/interop.py) is a second implementation written only from SPEC.md, so a misreading of the spec that bserve and bcurl share still fails. The cases that took the most work:
+[tests/interop.py](tests/interop.py) checks bserve and bcurl against a separate Python implementation of SPEC.md. The cases that took the most work:
 
 - a header block of exactly 65 535 bytes, and one with 300 fields;
 - a slow reader, a slow sender and an idle connection, each cut off by the deadlines;
